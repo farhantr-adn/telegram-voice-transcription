@@ -1,0 +1,43 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+swift_library(
+    name = "VoiceTranscriptScreen",
+    module_name = "VoiceTranscriptScreen",
+    srcs = glob([
+        "Sources/**/*.swift",
+    ]),
+    copts = [
+        "-warnings-as-errors",
+    ],
+    deps = [
+        "//submodules/Display",
+        "//submodules/AsyncDisplayKit",
+        "//submodules/SSignalKit/SwiftSignalKit",
+        "//submodules/TelegramCore",
+        "//submodules/Postbox",
+        "//submodules/TelegramPresentationData",
+        "//submodules/TelegramUIPreferences",
+        "//submodules/AccountContext",
+        "//submodules/AudioWaveform",
+        "//submodules/Media/LocalAudioTranscription",
+        "//submodules/Media/ConvertOpusToAAC",
+        "//submodules/TelegramStringFormatting",
+        "//submodules/ShimmerEffect",
+        "//submodules/ManagedAnimationNode",
+        "//submodules/LottieSettings:LottieSettings",
+        "//submodules/ComponentFlow",
+        "//submodules/ContextUI",
+        "//submodules/TelegramUI/Components/SliderContextItem",
+        "//submodules/TelegramUI/Components/MediaPlaybackHeaderPanelComponent",
+        "//submodules/Components/ComponentDisplayAdapters",
+        "//submodules/Components/MultilineTextComponent",
+        "//submodules/TelegramUI/Components/GlassControls",
+        "//submodules/TelegramUI/Components/GlassBackgroundComponent",
+        "//submodules/TelegramUI/Components/HorizontalTabsComponent",
+        "//submodules/MediaPlayer:UniversalMediaPlayer",
+        "//submodules/SearchBarNode",
+    ],
+    visibility = [
+        "//visibility:public",
+    ],
+)
