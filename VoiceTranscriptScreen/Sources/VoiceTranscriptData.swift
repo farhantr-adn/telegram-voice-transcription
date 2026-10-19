@@ -45,13 +45,19 @@ public struct VoiceTranscript: Equatable {
     }
 }
 
-public struct VoiceSummary: Equatable {
-    public struct KeyPoint: Equatable {
+public struct VoiceSummary: Equatable, Codable {
+    public struct KeyPoint: Equatable, Codable {
         public let time: Double
         public let text: String
     }
 
-    public struct Task: Equatable {
+    /// A question that is asked in the voice message, with the time where it is asked.
+    public struct Question: Equatable, Codable {
+        public let time: Double
+        public let text: String
+    }
+
+    public struct Task: Equatable, Codable {
         public let text: String
         public var isCompleted: Bool
     }
@@ -59,7 +65,9 @@ public struct VoiceSummary: Equatable {
     public let headline: String
     public let keyPoints: [KeyPoint]
     public var tasks: [Task]
-    public let questions: [String]
+    public let questions: [Question]
+    /// Placeholder text that is not made from the voice message; it is never shared.
+    public var isPlaceholder = false
 }
 
 public enum VoiceTranscriptState {
@@ -164,7 +172,7 @@ public final class MockVoiceTranscriptProvider: VoiceTranscriptProvider {
                 VoiceSummary.Task(text: "Decide whether to bring Hermione in.", isCompleted: false)
             ],
             questions: [
-                "Do we tell Dumbledore?"
+                VoiceSummary.Question(time: 48.0, text: "Do we tell Dumbledore?")
             ]
         )
     }
@@ -264,7 +272,12 @@ func voiceRandomSummary(seed: UInt64, transcript: VoiceTranscript) -> VoiceSumma
         headline: pick(headlines, 1)[0],
         keyPoints: keyPoints,
         tasks: tasks,
-        questions: pick(questionTexts, random.int(1...2))
+        questions: pick(questionTexts, random.int(1...2)).map { text in
+            // Each question is at the start of a line of the transcript.
+            let time = starts.isEmpty ? 0.0 : starts[random.int(0...(starts.count - 1))]
+            return VoiceSummary.Question(time: time, text: text)
+        },
+        isPlaceholder: true
     )
 }
 

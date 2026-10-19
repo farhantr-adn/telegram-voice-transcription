@@ -36,6 +36,8 @@ swift_library(
         "//submodules/TelegramUI/Components/HorizontalTabsComponent",
         "//submodules/MediaPlayer:UniversalMediaPlayer",
         "//submodules/SearchBarNode",
+        "//submodules/TelegramUI/Components/EdgeEffect",
+        "//submodules/UndoUI",
     ],
     visibility = [
         "//visibility:public",

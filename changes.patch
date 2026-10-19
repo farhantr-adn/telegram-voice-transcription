@@ -1,8 +1,45 @@
+diff --git a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+index 5c82abec65..19d43f43f3 100644
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+@@ -17096,3 +17096,22 @@ Error: %8$@";
+ "Notification.GramTransfer.UnknownUser" = "UNKNOWN USER";
+ 
+ "Chat.ViewStyle" = "VIEW STYLE";
++
++"VoiceTranscript.Transcript" = "Transcript";
++"VoiceTranscript.AISummary" = "AI Summary";
++"VoiceTranscript.Synchronize" = "Synchronize";
++"VoiceTranscript.KeyPoints" = "Key points";
++"VoiceTranscript.Tasks" = "Tasks";
++"VoiceTranscript.Questions" = "Questions";
++"VoiceTranscript.SummarySource" = "Cocoon AI Summary";
++"VoiceTranscript.More" = "more";
++"VoiceTranscript.Less" = "less";
++"VoiceTranscript.TasksCompleted" = "%1$@ of %2$@ completed";
++"VoiceTranscript.SummaryUnavailable" = "The summary is not available for this voice message";
++"VoiceTranscript.TranscriptUnavailable" = "Transcript is not available for this voice message";
++"VoiceTranscript.CopyTranscript" = "Copy Transcript";
++"VoiceTranscript.TranslateTranscript" = "Translate Transcript";
++"VoiceTranscript.NextVoice" = "Next Voice";
++"VoiceTranscript.PreviousVoice" = "Previous Voice";
++"VoiceTranscript.ItemsHint" = "Tap the time to jump to it in the transcript. Tap the text to reply in the chat or copy it.";
++"VoiceTranscript.TasksHint" = "Tap a task to mark it as done.";
 diff --git a/submodules/AccountContext/Sources/AccountContext.swift b/submodules/AccountContext/Sources/AccountContext.swift
-index 2911a6699d..85729516e8 100644
+index 2911a6699d..301ecc4f0c 100644
 --- a/submodules/AccountContext/Sources/AccountContext.swift
 +++ b/submodules/AccountContext/Sources/AccountContext.swift
-@@ -1454,6 +1454,7 @@ public protocol SharedAccountContext: AnyObject {
+@@ -1371,7 +1371,8 @@ public final class TextProcessingScreenSendContextActions {
+ 
+ public enum TextProcessingScreenMode {
+     case edit(saveRestoreStateId: EnginePeer.Id?, completion: (ComposedRichMessage) -> Void, send: ((ComposedRichMessage) -> Void)?, sendContextActions: TextProcessingScreenSendContextActions?)
+-    case translate(fromLanguage: String?, applyResult: ((ComposedRichMessage) -> Void)?)
++    /// `displaysInfoButton` is false when the screen is opened from one that already has an information screen of its own on top.
++    case translate(fromLanguage: String?, applyResult: ((ComposedRichMessage) -> Void)?, displaysInfoButton: Bool = true)
+     case preview(style: TelegramComposeAIMessageMode.CloudStyle.Custom, authorPeer: EnginePeer?, initialPreview: AIMessageStylePreview?, isAlreadyAdded: Bool, added: () -> Void)
+     case generate(completion: (ComposedRichMessage) -> Void)
+ }
+@@ -1454,6 +1455,7 @@ public protocol SharedAccountContext: AnyObject {
      func messageFromPreloadedChatHistoryViewForLocation(id: EngineMessage.Id, location: ChatHistoryLocationInput, context: AccountContext, chatLocation: ChatLocation, subject: ChatControllerSubject?, chatLocationContextHolder: Atomic<ChatLocationContextHolder?>, tag: EngineHistoryViewInputTag?) -> Signal<(EngineMessage.Index?, Bool), NoError>
      
      func makeOverlayAudioPlayerController(context: AccountContext, chatLocation: ChatLocation, type: MediaManagerPlayerType, initialMessageId: EngineMessage.Id, initialOrder: MusicPlaybackSettingsOrder, playlistLocation: SharedMediaPlaylistLocation?, parentNavigationController: NavigationController?) -> ViewController & OverlayAudioPlayerController
@@ -37,6 +74,57 @@ index aa1c752fc9..9785dd33f5 100644
  }
  
  public enum SharedMediaPlaylistControlAction {
+diff --git a/submodules/AccountContext/Sources/VoiceReplyFragment.swift b/submodules/AccountContext/Sources/VoiceReplyFragment.swift
+new file mode 100644
+index 0000000000..b3e8b99064
+--- /dev/null
++++ b/submodules/AccountContext/Sources/VoiceReplyFragment.swift
+@@ -0,0 +1,45 @@
++import Foundation
++import TelegramCore
++
++/// The part of a voice message a reply is about, chosen in the voice transcript sheet: the time (or time range) it covers as it
++/// reads there, and the text of the chosen words. It only affects how the reply is shown in the chat's input panel; it is
++/// not sent anywhere.
++public struct VoiceReplyFragment: Codable, Equatable {
++    public var timeText: String
++    public var text: String
++    
++    public init(timeText: String, text: String) {
++        self.timeText = timeText
++        self.text = text
++    }
++}
++
++/// Holds a chosen fragment for the moment between pressing Reply in the transcript sheet and the chat setting the reply up:
++/// the chat opens asynchronously and sets the reply by message id alone, so this is how the fragment reaches it. It is read
++/// once, and goes stale after a few seconds. Main thread only.
++public final class VoiceReplyFragmentStore {
++    public static let shared = VoiceReplyFragmentStore()
++    
++    private var pending: (id: EngineMessage.Id, fragment: VoiceReplyFragment, date: Double)?
++    
++    private init() {
++    }
++    
++    public func set(_ fragment: VoiceReplyFragment, for id: EngineMessage.Id) {
++        self.pending = (id, fragment, CFAbsoluteTimeGetCurrent())
++    }
++    
++    public func take(for id: EngineMessage.Id) -> VoiceReplyFragment? {
++        guard let pending = self.pending else {
++            return nil
++        }
++        if pending.id != id {
++            return nil
++        }
++        self.pending = nil
++        if CFAbsoluteTimeGetCurrent() - pending.date > 15.0 {
++            return nil
++        }
++        return pending.fragment
++    }
++}
 diff --git a/submodules/ChatInterfaceState/Sources/ChatInterfaceState.swift b/submodules/ChatInterfaceState/Sources/ChatInterfaceState.swift
 index e50d5d3933..45d1bdbaa6 100644
 --- a/submodules/ChatInterfaceState/Sources/ChatInterfaceState.swift
@@ -389,6 +477,55 @@ index 8acf74a323..546fdf2ec4 100644
                              } else {
                                  component.context.sharedContext.navigateToChat(accountId: component.context.account.id, peerId: id.messageId.peerId, messageId: id.messageId)
                              }
+diff --git a/submodules/TelegramUI/Components/TextProcessingScreen/Sources/TextProcessingScreen.swift b/submodules/TelegramUI/Components/TextProcessingScreen/Sources/TextProcessingScreen.swift
+index 21f7d3b623..468d0afa7b 100644
+--- a/submodules/TelegramUI/Components/TextProcessingScreen/Sources/TextProcessingScreen.swift
++++ b/submodules/TelegramUI/Components/TextProcessingScreen/Sources/TextProcessingScreen.swift
+@@ -1600,7 +1600,7 @@ private final class TextProcessingSheetComponent: Component {
+                             dismiss(true)
+                         }
+                     }
+-                case let .translate(_, applyResult):
++                case let .translate(_, applyResult, _):
+                     if let applyResult {
+                         actionButtonTitle = environmentValue.strings.TextProcessing_ActionApply
+                         isMainActionEnabled = !self.contentExternalState.isProcessing && self.contentExternalState.result != nil
+@@ -1725,18 +1725,25 @@ private final class TextProcessingSheetComponent: Component {
+             }
+ 
+             var displayInfoButton = true
++            // The top edge effect stays when only the information button is left out.
++            var hasTopEdgeEffect = true
+             let titleString: String
+             switch component.mode {
+             case .edit:
+                 titleString = environmentValue.strings.TextProcessing_TitleEdit
+-            case .translate:
++            case let .translate(_, _, displaysInfoButton):
+                 titleString = environmentValue.strings.TextProcessing_TitleTranslate
++                if !displaysInfoButton {
++                    displayInfoButton = false
++                }
+             case .preview:
+                 titleString = ""
+                 displayInfoButton = false
++                hasTopEdgeEffect = false
+             case .generate:
+                 titleString = environmentValue.strings.TextProcessing_TitleAICompose
+                 displayInfoButton = false
++                hasTopEdgeEffect = false
+             }
+             
+ 
+@@ -1893,7 +1900,7 @@ private final class TextProcessingSheetComponent: Component {
+                             }
+                         )
+                     ) : nil,
+-                    hasTopEdgeEffect: displayInfoButton,
++                    hasTopEdgeEffect: hasTopEdgeEffect,
+                     bottomItem: AnyComponent(
+                         ActionButtonsComponent(
+                             theme: theme,
 diff --git a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift b/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
 index a017f153f8..f8e33d0f89 100644
 --- a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
@@ -505,54 +642,3 @@ index 740fdbcb70..c738773cf5 100644
              case let .setBaseRate(baseRate):
                  self.playbackRate = baseRate
                  if let playbackItem = self.playbackItem {
-diff --git a/submodules/AccountContext/Sources/VoiceReplyFragment.swift b/submodules/AccountContext/Sources/VoiceReplyFragment.swift
-new file mode 100644
-index 0000000000..b3e8b99064
---- /dev/null
-+++ b/submodules/AccountContext/Sources/VoiceReplyFragment.swift
-@@ -0,0 +1,45 @@
-+import Foundation
-+import TelegramCore
-+
-+/// The part of a voice message a reply is about, chosen in the voice transcript sheet: the time (or time range) it covers as it
-+/// reads there, and the text of the chosen words. It only affects how the reply is shown in the chat's input panel; it is
-+/// not sent anywhere.
-+public struct VoiceReplyFragment: Codable, Equatable {
-+    public var timeText: String
-+    public var text: String
-+    
-+    public init(timeText: String, text: String) {
-+        self.timeText = timeText
-+        self.text = text
-+    }
-+}
-+
-+/// Holds a chosen fragment for the moment between pressing Reply in the transcript sheet and the chat setting the reply up:
-+/// the chat opens asynchronously and sets the reply by message id alone, so this is how the fragment reaches it. It is read
-+/// once, and goes stale after a few seconds. Main thread only.
-+public final class VoiceReplyFragmentStore {
-+    public static let shared = VoiceReplyFragmentStore()
-+    
-+    private var pending: (id: EngineMessage.Id, fragment: VoiceReplyFragment, date: Double)?
-+    
-+    private init() {
-+    }
-+    
-+    public func set(_ fragment: VoiceReplyFragment, for id: EngineMessage.Id) {
-+        self.pending = (id, fragment, CFAbsoluteTimeGetCurrent())
-+    }
-+    
-+    public func take(for id: EngineMessage.Id) -> VoiceReplyFragment? {
-+        guard let pending = self.pending else {
-+            return nil
-+        }
-+        if pending.id != id {
-+            return nil
-+        }
-+        self.pending = nil
-+        if CFAbsoluteTimeGetCurrent() - pending.date > 15.0 {
-+            return nil
-+        }
-+        return pending.fragment
-+    }
-+}

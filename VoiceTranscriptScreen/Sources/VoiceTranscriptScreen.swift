@@ -24,6 +24,8 @@ import UniversalMediaPlayer
 import ManagedAnimationNode
 import LottieSettings
 import SearchBarNode
+import EdgeEffect
+import UndoUI
 
 // The design colours have no theme variable: 0088FF and 727272 are used as is in the light theme,
 // and the closest theme colours stand in for them in the dark one. Read text is the theme's primary text colour.
@@ -87,6 +89,32 @@ private func voiceTranscriptSymbolImage(_ name: String, fit: CGFloat, weight: UI
         source.draw(in: CGRect(origin: CGPoint(), size: size))
     }
     return image.withRenderingMode(.alwaysTemplate)
+}
+
+/// The checkbox of a task, drawn to fill exactly `diameter` points: an outline, or a filled circle with a check. An SF Symbol of
+/// this size is smaller than its image (the symbols have space around the glyph), so the circle is drawn here instead.
+private func voiceSummaryCheckboxImage(isChecked: Bool, diameter: CGFloat, outlineColor: UIColor, fillColor: UIColor) -> UIImage {
+    let size = CGSize(width: diameter, height: diameter)
+    return UIGraphicsImageRenderer(size: size).image { context in
+        let cgContext = context.cgContext
+        if isChecked {
+            cgContext.setFillColor(fillColor.cgColor)
+            cgContext.fillEllipse(in: CGRect(origin: CGPoint(), size: size))
+            cgContext.setStrokeColor(UIColor.white.cgColor)
+            cgContext.setLineWidth(2.0)
+            cgContext.setLineCap(.round)
+            cgContext.setLineJoin(.round)
+            cgContext.move(to: CGPoint(x: diameter * 0.29, y: diameter * 0.52))
+            cgContext.addLine(to: CGPoint(x: diameter * 0.44, y: diameter * 0.67))
+            cgContext.addLine(to: CGPoint(x: diameter * 0.72, y: diameter * 0.35))
+            cgContext.strokePath()
+        } else {
+            let lineWidth: CGFloat = 1.5
+            cgContext.setStrokeColor(outlineColor.cgColor)
+            cgContext.setLineWidth(lineWidth)
+            cgContext.strokeEllipse(in: CGRect(origin: CGPoint(), size: size).insetBy(dx: lineWidth / 2.0, dy: lineWidth / 2.0))
+        }
+    }.withRenderingMode(.alwaysOriginal)
 }
 
 /// The plain "→A" glyph of the Transcript tab (the app's own transcription icons carry a microphone or a lock).
@@ -280,12 +308,21 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     private let tabs = ComponentView<Empty>()
     /// The AI Summary tab has no player: it ends with this button instead.
     private let closeButton = UIButton(type: .custom)
+    /// The fade with a blur under the big button, as under the fixed buttons of other sheets, so the content does not run into it.
+    private let summaryEdgeEffect = EdgeEffectView()
+    private var summaryEdgeEffectSize = CGSize()
     private let sheetMaskLayer = CAShapeLayer()
     /// Everything inside the sheet is laid out at one fixed width in here, so expanding the sheet never re-wraps the text.
     private let innerView = UIView()
     private let linkTarget = VoiceTranscriptLinkTarget()
     private var expansionLink: CADisplayLink?
     private var expansionAnimation: (from: CGFloat, to: CGFloat, start: Double, duration: Double)?
+    /// How far the search is open: 0 is the sheet as it is, 1 is the search bar in place of the header, with the list under it
+    /// and the player gone. It is animated on the same display link, with the same curve, as the expansion, so the header, the
+    /// list, the player and the sheet itself move together.
+    private var searchProgress: CGFloat = 0.0
+    private var searchAnimation: (from: CGFloat, to: CGFloat, start: Double, duration: Double)?
+    private var listTopSearch: CGFloat = 0.0
     private var topExpanded: CGFloat = 0.0
     private var topCollapsed: CGFloat = 0.0
     private var contentWidth: CGFloat = 0.0
@@ -306,6 +343,8 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     private var messageDuration: Double?
     private var panStartExpansion: CGFloat = 0.0
     private var didRequestTranscript = false
+    /// When the transcript started to load: one that took a while was asked of the server, and costs a free try.
+    private var transcriptLoadingStartTime: Double?
     private let transcriptDisposable = MetaDisposable()
     private let summaryDisposable = MetaDisposable()
 
@@ -368,7 +407,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         self.grabberNode.cornerRadius = 3.0
 
         self.transcriptView = VoiceTranscriptListView(theme: theme)
-        self.summaryView = VoiceSummaryView(theme: theme)
+        self.summaryView = VoiceSummaryView(theme: theme, strings: self.presentationData.strings, baseFontSize: voiceSummaryBaseFontSize(self.presentationData.listsFontSize))
         self.controlsView = VoiceTranscriptControlsView(theme: theme, lottieSettings: context.lottieRenderingSettings)
 
         super.init()
@@ -382,7 +421,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         self.innerView.addSubview(self.summaryView)
         self.innerView.addSubview(self.controlsView)
         self.innerView.addSubview(self.syncButton)
-        self.syncButton.configure(textColor: theme.list.itemPrimaryTextColor, isDark: theme.overallDarkAppearance)
+        self.syncButton.configure(title: self.presentationData.strings.VoiceTranscript_Synchronize, textColor: theme.list.itemPrimaryTextColor, isDark: theme.overallDarkAppearance)
         self.syncButton.pressed = { [weak self] in
             self?.transcriptView.resumeFollowing()
         }
@@ -391,16 +430,28 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             self?.updateSyncButton(animated: true)
         }
         self.innerView.addSubview(self.closeButton)
-        self.closeButton.setTitle(self.presentationData.strings.Common_Close, for: .normal)
+        self.innerView.insertSubview(self.summaryEdgeEffect, belowSubview: self.closeButton)
+        self.summaryEdgeEffect.isUserInteractionEnabled = false
+        self.summaryEdgeEffect.isHidden = true
+        // The button is Share under the summary: it is dimmed and does nothing until there is a real summary to share.
+        self.closeButton.setTitle(self.presentationData.strings.Conversation_ContextMenuShare, for: .normal)
+        self.closeButton.isEnabled = false
         self.closeButton.setTitleColor(theme.list.itemCheckColors.foregroundColor, for: .normal)
         self.closeButton.titleLabel?.font = Font.semibold(17.0)
-        self.closeButton.backgroundColor = theme.list.itemCheckColors.fillColor
+        self.closeButton.setTitleColor(theme.list.itemCheckColors.foregroundColor.withAlphaComponent(0.7), for: .disabled)
+        self.closeButton.backgroundColor = self.closeButtonFill(isEnabled: false)
         self.closeButton.layer.cornerRadius = VoiceTranscriptScreenNode.closeButtonHeight / 2.0
         self.closeButton.isHidden = true
         self.closeButton.isUserInteractionEnabled = false
         self.closeButton.addAction(UIAction { [weak self] _ in
-            self?.requestDismiss()
+            self?.closeButtonPressed()
         }, for: .touchUpInside)
+        self.summaryView.copied = { [weak self] in
+            self?.showCopiedToast()
+        }
+        self.summaryView.stateChanged = { [weak self] in
+            self?.updateCloseButtonTitle()
+        }
         self.sheetNode.addSubnode(self.grabberNode)
         self.innerView.addSubview(self.tabsBackgroundContainer)
         self.tabsBackgroundContainer.contentView.addSubview(self.tabsBackgroundView)
@@ -417,6 +468,9 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             }
             self.requestReply(self.messageId, VoiceReplyFragment(timeText: timeText, text: text))
         }
+        self.transcriptView.requestTranslate = { [weak self] text in
+            self?.presentTranslate(text: text)
+        }
         self.transcriptView.presentationData = self.presentationData
         self.transcriptView.consumeScroll = { [weak self] delta in
             return self?.consumeExpansion(delta: delta) ?? 0.0
@@ -432,11 +486,8 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         self.summaryView.saveTaskStates = { states in
             UserDefaults.standard.set(states, forKey: tasksKey)
         }
-        self.summaryView.questionTapped = { [weak self] text in
-            guard let self else {
-                return
-            }
-            self.requestReply(self.messageId, VoiceReplyFragment(timeText: "", text: text))
+        self.summaryView.itemMenuRequested = { [weak self] sourceView, setActive, text, time in
+            self?.presentItemMenu(sourceView: sourceView, setActive: setActive, text: text, time: time)
         }
         self.summaryView.seekTo = { [weak self] time in
             guard let self else {
@@ -566,7 +617,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         )
         self.searchBar = searchBar
         self.innerView.addSubview(searchBar.view)
-        searchBar.placeholderString = NSAttributedString(string: "Search", font: Font.regular(17.0), textColor: theme.rootController.navigationSearchBar.inputPlaceholderTextColor)
+        searchBar.placeholderString = NSAttributedString(string: self.presentationData.strings.Common_Search, font: Font.regular(17.0), textColor: theme.rootController.navigationSearchBar.inputPlaceholderTextColor)
         searchBar.textUpdated = { [weak self] text, _ in
             let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
             self?.transcriptView.searchQuery = query.isEmpty ? nil : query
@@ -580,23 +631,112 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         return searchBar
     }
 
+    /// The fill of the big button. A button that cannot be used yet is not made see-through (the content scrolls under it): its
+    /// colour is mixed with the colour of the sheet instead.
+    private func closeButtonFill(isEnabled: Bool) -> UIColor {
+        let theme = self.presentationData.theme
+        let fill = theme.list.itemCheckColors.fillColor
+        return isEnabled ? fill : fill.mixedWith(theme.list.modalBlocksBackgroundColor, alpha: 0.55)
+    }
+
+    /// The big button under the summary is always "Share": it is dimmed until there is a real summary to share, so its title
+    /// does not change when the summary arrives.
+    private func updateCloseButtonTitle() {
+        let isShareable = self.summaryView.shareableText != nil
+        self.closeButton.isEnabled = isShareable
+        #if DEBUG
+        switch self.summaryView.state {
+        case .loading:
+            print("[VoiceSummary] Share is off: the summary is still being made")
+        case .unavailable:
+            print("[VoiceSummary] Share is off: there is no summary")
+        case let .ready(summary):
+            print("[VoiceSummary] Share is \(isShareable ? "on" : "off"): the summary is ready, placeholder: \(summary.isPlaceholder)")
+        }
+        #endif
+        UIView.animate(withDuration: 0.2, delay: 0.0, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
+            self.closeButton.backgroundColor = self.closeButtonFill(isEnabled: isShareable)
+        })
+    }
+
+    /// The translator of the app, with `text` in it.
+    private func presentTranslate(text: String) {
+        guard let controller = self.getController() else {
+            return
+        }
+        let context = self.context
+        Task { @MainActor [weak controller] in
+            let translateController = await context.sharedContext.makeTextProcessingScreen(
+                context: context,
+                theme: nil,
+                // The information button is left out: this sheet is already one of two on screen, and the information screen
+                // it opens could not be shown over them.
+                mode: .translate(fromLanguage: nil, applyResult: nil, displaysInfoButton: false),
+                inputText: .plain(text: text, entities: []),
+                copyResult: { result in
+                    if case let .plain(text, _) = result {
+                        UIPasteboard.general.string = text
+                    }
+                },
+                translateChat: nil
+            )
+            controller?.present(translateController, in: .window(.root))
+        }
+    }
+
+    private func closeButtonPressed() {
+        guard let text = self.summaryView.shareableText, let controller = self.getController() else {
+            self.requestDismiss()
+            return
+        }
+        let shareController = self.context.sharedContext.makeShareController(context: self.context, params: ShareControllerParams(subject: .text(text), externalShare: false))
+        controller.present(shareController, in: .window(.root))
+    }
+
+    /// The search bar, in the place of the header. Only its own layout; the rest of the sheet is not laid out again for it.
+    private func layoutSearchBar(width: CGFloat, transition: ContainedViewLayoutTransition) {
+        let barFrame = CGRect(x: 0.0, y: 16.0, width: width, height: 44.0)
+        let searchBar = self.ensureSearchBar()
+        transition.updateFrame(node: searchBar, frame: barFrame)
+        searchBar.updateLayout(boundingSize: barFrame.size, leftInset: 0.0, rightInset: 0.0, transition: transition)
+    }
+
+    /// Made a moment after the sheet has opened, so that pressing search does not pay for it in the middle of the animation.
+    private func prepareSearchBar() {
+        if self.searchBar != nil || self.contentWidth <= 0.0 {
+            return
+        }
+        let searchBar = self.ensureSearchBar()
+        searchBar.view.isHidden = true
+        self.layoutSearchBar(width: self.contentWidth, transition: .immediate)
+    }
+
     private func beginSearch() {
         if self.isSearching {
             return
         }
         self.isSearching = true
-        self.transcriptView.isSearchMode = true
         self.selectedTab = .transcript
         self.transcriptView.isHidden = false
         self.summaryView.isHidden = true
         self.transcriptView.isAutoScrollEnabled = false
-        let searchBar = self.ensureSearchBar()
-        searchBar.view.isHidden = false
-        if let layout = self.validLayout {
-            self.containerLayoutUpdated(layout, transition: .immediate)
+        // As little as possible happens before the first frame of the animation. The search bar exists already (or is made here
+        // and laid out on its own), and the keyboard comes when the animation has finished: it takes the main thread for a while the
+        // first time, and the animation runs on it.
+        self.prepareSearchBar()
+        if self.searchBar == nil {
+            self.layoutSearchBar(width: self.contentWidth, transition: .immediate)
         }
+        self.searchBar?.view.alpha = 0.0
+        self.animateSearch(to: 1.0)
         self.animateExpansion(to: 1.0, duration: 0.4)
-        searchBar.activate()
+        // The words are not highlighted while searching; it is applied after the first frame, not before it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.transcriptView.isSearchMode = self.isSearching
+        }
     }
 
     private func endSearch() {
@@ -609,14 +749,76 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         self.searchBar?.deactivate(clear: false)
         self.transcriptView.searchQuery = nil
         self.transcriptView.isAutoScrollEnabled = true
-        self.searchBar?.view.isHidden = true
-        if let layout = self.validLayout {
-            self.containerLayoutUpdated(layout, transition: .immediate)
+        self.applyPageVisibility()
+        self.animateSearch(to: 0.0)
+    }
+
+    /// The search is open or closed: the player and the header are put back, or taken away, for good.
+    private func searchAnimationFinished() {
+        if self.searchProgress <= 0.001 {
+            self.searchBar?.view.isHidden = true
         }
+        self.applyPageVisibility()
+        if self.isSearching && self.searchProgress >= 0.999 {
+            self.searchBar?.activate()
+        }
+    }
+
+    private func animateSearch(to target: CGFloat, duration: Double = 0.4) {
+        self.searchAnimation = (self.searchProgress, target, CACurrentMediaTime(), duration)
+        self.ensureDisplayLink()
     }
 
     /// The "more" menu above the button: the actions on the whole voice message, then the neighbouring voice messages. It is
     /// Telegram's own vertical context menu, which opens above the button because there is no room under it.
+    private func showCopiedToast() {
+        guard let controller = self.getController() else {
+            return
+        }
+        let presentationData = self.presentationData
+        controller.present(UndoOverlayController(presentationData: presentationData, content: .copy(text: presentationData.strings.Conversation_TextCopied), elevatedLayout: false, animateInAsReplacement: false, action: { _ in return false }), in: .window(.root))
+    }
+
+    /// The menu of a key point or a question: Reply (to the voice message, with the item and its time quoted) and Copy. It opens right
+    /// under the item, and above it only when there is no room below.
+    private func presentItemMenu(sourceView: UIView, setActive: @escaping (Bool) -> Void, text: String, time: Double) {
+        guard let controller = self.getController() else {
+            return
+        }
+        let presentationData = self.presentationData
+        let strings = presentationData.strings
+
+        func icon(_ name: String) -> (PresentationTheme) -> UIImage? {
+            return { theme in
+                return generateTintedImage(image: UIImage(bundleImageName: name), color: theme.contextMenu.primaryColor)
+            }
+        }
+        var items: [ContextMenuItem] = []
+        items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuReply, icon: icon("Chat/Context Menu/Reply"), action: { [weak self] _, f in
+            f(.default)
+            guard let self else {
+                return
+            }
+            self.requestReply(self.messageId, VoiceReplyFragment(timeText: formatVoiceTranscriptTime(time), text: text))
+        })))
+        items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuCopy, icon: icon("Chat/Context Menu/Copy"), action: { [weak self] _, f in
+            f(.default)
+            UIPasteboard.general.string = text
+            self?.showCopiedToast()
+        })))
+        let contextController = makeContextController(
+            presentationData: presentationData,
+            source: .reference(VoiceTranscriptItemContextSource(referenceView: sourceView)),
+            items: .single(ContextController.Items(content: .list(items))),
+            gesture: nil
+        )
+        setActive(true)
+        contextController.dismissed = {
+            setActive(false)
+        }
+        controller.presentInGlobalOverlay(contextController)
+    }
+
     private func presentMoreMenu(sourceView: UIView) {
         guard let controller = self.getController() else {
             return
@@ -648,33 +850,19 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             // A reply to the whole voice message.
             self?.requestReply(messageId, nil)
         })))
-        items.append(.action(ContextMenuActionItem(text: "Copy Transcript", textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Copy"), action: { _, f in
+        items.append(.action(ContextMenuActionItem(text: strings.VoiceTranscript_CopyTranscript, textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Copy"), action: { _, f in
             f(.default)
             if hasTranscript {
                 UIPasteboard.general.string = transcriptText
             }
         })))
-        items.append(.action(ContextMenuActionItem(text: "Translate Transcript", textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Translate"), action: { [weak controller] _, f in
+        items.append(.action(ContextMenuActionItem(text: strings.VoiceTranscript_TranslateTranscript, textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Translate"), action: { [weak self] _, f in
             f(.default)
             guard hasTranscript else {
                 return
             }
             // The translator of the app, with the whole transcript in it.
-            Task { @MainActor [weak controller] in
-                let translateController = await context.sharedContext.makeTextProcessingScreen(
-                    context: context,
-                    theme: nil,
-                    mode: .translate(fromLanguage: nil, applyResult: nil),
-                    inputText: .plain(text: transcriptText, entities: []),
-                    copyResult: { result in
-                        if case let .plain(text, _) = result {
-                            UIPasteboard.general.string = text
-                        }
-                    },
-                    translateChat: nil
-                )
-                controller?.present(translateController, in: .window(.root))
-            }
+            self?.presentTranslate(text: transcriptText)
         })))
         items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuForward, icon: icon("Chat/Context Menu/Forward"), action: { [weak controller] _, f in
             f(.default)
@@ -689,13 +877,13 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             })
         })))
         items.append(.separator)
-        items.append(.action(ContextMenuActionItem(text: "Next Voice", textColor: self.hasNextVoice ? .primary : .disabled, icon: symbolIcon("forward.end"), action: { [weak self] _, f in
+        items.append(.action(ContextMenuActionItem(text: strings.VoiceTranscript_NextVoice, textColor: self.hasNextVoice ? .primary : .disabled, icon: symbolIcon("forward.end"), action: { [weak self] _, f in
             f(.default)
             if self?.hasNextVoice == true {
                 mediaManager.playlistControl(.next, type: .voice)
             }
         })))
-        items.append(.action(ContextMenuActionItem(text: "Previous Voice", textColor: self.hasPreviousVoice ? .primary : .disabled, icon: symbolIcon("backward.end"), action: { [weak self] _, f in
+        items.append(.action(ContextMenuActionItem(text: strings.VoiceTranscript_PreviousVoice, textColor: self.hasPreviousVoice ? .primary : .disabled, icon: symbolIcon("backward.end"), action: { [weak self] _, f in
             f(.default)
             if self?.hasPreviousVoice == true {
                 mediaManager.playlistControl(.previous, type: .voice)
@@ -769,13 +957,16 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         let transcript = self.selectedTab == .transcript
         self.transcriptView.isHidden = !transcript
         self.summaryView.isHidden = transcript
-        self.controlsView.isHidden = self.isSearching || !transcript
-        self.syncButton.isHidden = self.isSearching || !transcript
+        // The player stays until the search has fully opened (it fades out on the way), and is back at once when it closes.
+        let isSearchOpen = self.isSearching && self.searchProgress >= 0.999
+        self.controlsView.isHidden = isSearchOpen || !transcript
+        self.syncButton.isHidden = isSearchOpen || !transcript
         self.closeButton.isHidden = self.isSearching || transcript
+        self.summaryEdgeEffect.isHidden = self.isSearching || transcript
     }
 
     private var pageViews: (transcript: [UIView], summary: [UIView]) {
-        return ([self.transcriptView, self.controlsView, self.syncButton], [self.summaryView, self.closeButton])
+        return ([self.transcriptView, self.controlsView, self.syncButton], [self.summaryView, self.summaryEdgeEffect, self.closeButton])
     }
 
     private func finishTabSwitch() {
@@ -871,6 +1062,10 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     /// bottom panel always agree. Animating each view separately let them drift apart mid-animation.
     private func animateExpansion(to target: CGFloat, duration: Double = 0.4) {
         self.expansionAnimation = (self.expansion, target, CACurrentMediaTime(), duration)
+        self.ensureDisplayLink()
+    }
+
+    private func ensureDisplayLink() {
         if self.expansionLink == nil {
             self.linkTarget.action = { [weak self] in
                 self?.stepExpansionAnimation()
@@ -882,25 +1077,52 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     }
 
     private func stepExpansionAnimation() {
-        guard let animation = self.expansionAnimation else {
-            self.stopExpansionAnimation()
+        if self.expansionAnimation == nil && self.searchAnimation == nil {
+            self.invalidateDisplayLink()
             return
         }
-        let progress = CGFloat(min(1.0, (CACurrentMediaTime() - animation.start) / animation.duration))
-        // The curve every Telegram spring animation uses (the same one as the standard `.spring` transitions).
-        let eased = progress >= 1.0 ? 1.0 : listViewAnimationCurveSystem(progress)
-        self.expansion = animation.from + (animation.to - animation.from) * eased
+        let now = CACurrentMediaTime()
+        var searchFinished = false
+        if let animation = self.expansionAnimation {
+            let progress = CGFloat(min(1.0, (now - animation.start) / animation.duration))
+            // The curve every Telegram spring animation uses (the same one as the standard `.spring` transitions).
+            let eased = progress >= 1.0 ? 1.0 : listViewAnimationCurveSystem(progress)
+            self.expansion = animation.from + (animation.to - animation.from) * eased
+            if progress >= 1.0 {
+                self.expansion = animation.to
+                self.expansionAnimation = nil
+            }
+        }
+        if let animation = self.searchAnimation {
+            let progress = CGFloat(min(1.0, (now - animation.start) / animation.duration))
+            let eased = progress >= 1.0 ? 1.0 : listViewAnimationCurveSystem(progress)
+            self.searchProgress = animation.from + (animation.to - animation.from) * eased
+            if progress >= 1.0 {
+                self.searchProgress = animation.to
+                self.searchAnimation = nil
+                searchFinished = true
+            }
+        }
         self.applyGeometry()
-        if progress >= 1.0 {
-            self.expansion = animation.to
-            self.stopExpansionAnimation()
+        if searchFinished {
+            self.searchAnimationFinished()
+        }
+        if self.expansionAnimation == nil && self.searchAnimation == nil {
+            self.invalidateDisplayLink()
         }
     }
 
-    private func stopExpansionAnimation() {
+    private func invalidateDisplayLink() {
         self.expansionLink?.invalidate()
         self.expansionLink = nil
+    }
+
+    /// Stops the animation of the expansion only: the search animation, when there is one, goes on.
+    private func stopExpansionAnimation() {
         self.expansionAnimation = nil
+        if self.searchAnimation == nil {
+            self.invalidateDisplayLink()
+        }
     }
 
     private func loadMessage() {
@@ -942,6 +1164,8 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         self.summaryView.state = .loading
         self.transcript = nil
         self.transcriptView.placeholder = nil
+        self.transcriptView.unavailableMessage = nil
+        self.transcriptLoadingStartTime = nil
         self.transcriptView.transcript = nil
         self.scrubbingTime = nil
         self.controlsView.waveform = nil
@@ -964,6 +1188,47 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         }))
     }
 
+    /// For an account without Premium, after a transcript was made by the server: how many free ones are left this week, in the
+    /// same words and the same tip as in the chat.
+    private func showFreeTranscriptionTooltip() {
+        if self.context.isPremium {
+            return
+        }
+        let _ = (self.context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.AudioTranscriptionTrial())
+        |> deliverOnMainQueue).start(next: { [weak self] trial in
+            guard let self, let controller = self.getController(), trial.remainingCount > 0 else {
+                return
+            }
+            let presentationData = self.presentationData
+            let text = presentationData.strings.Conversation_FreeTranscriptionLimitTooltip(trial.remainingCount)
+            controller.present(UndoOverlayController(presentationData: presentationData, content: .universal(animation: "Transcribe", scale: 0.06, colors: [:], title: nil, text: text, customUndoText: nil, timeout: 5.0), elevatedLayout: false, position: .top, animateInAsReplacement: false, action: { _ in return false }), in: .window(.root))
+        })
+    }
+
+    /// When the free transcriptions of the week are used up, the empty list says so (and when they come back), instead of the
+    /// general "not available".
+    private func updateTranscriptUnavailableMessage() {
+        if self.context.isPremium {
+            return
+        }
+        let context = self.context
+        let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.AudioTranscriptionTrial())
+        |> deliverOnMainQueue).start(next: { [weak self] trial in
+            guard let self, let cooldownUntilTime = trial.cooldownUntilTime, cooldownUntilTime > Int32(Date().timeIntervalSince1970) else {
+                return
+            }
+            let presentationData = self.presentationData
+            let strings = presentationData.strings
+            let premiumConfiguration = PremiumConfiguration.with(appConfiguration: context.currentAppConfiguration.with { $0 })
+            let time = stringForMediumDate(timestamp: cooldownUntilTime, strings: strings, dateTimeFormat: presentationData.dateTimeFormat)
+            let used = strings.Conversation_FreeTranscriptionCooldownTooltip(premiumConfiguration.audioTransciptionTrialCount)
+            let wait = strings.Conversation_FreeTranscriptionWaitOrSubscribe(time).string
+            // The strings carry markup for the tip of the chat; this is plain text.
+            let text = (used + " " + wait).replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "[Telegram Premium]()", with: "Telegram Premium")
+            self.transcriptView.unavailableMessage = text
+        })
+    }
+
     private func ensureTranscript(duration: Double) {
         // Wait for the player's position so the list opens already scrolled to the spoken word.
         guard !self.didRequestTranscript, duration > 0.0, self.statusValue != nil else {
@@ -977,9 +1242,11 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             }
             switch state {
             case .loading:
+                self.transcriptLoadingStartTime = CACurrentMediaTime()
                 self.transcriptView.placeholder = .loading
             case .unavailable:
                 self.transcriptView.placeholder = .unavailable
+                self.updateTranscriptUnavailableMessage()
                 // No transcript, nothing to summarise.
                 self.summaryDisposable.set(nil)
                 #if DEBUG
@@ -988,6 +1255,10 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
                 self.summaryView.state = .unavailable
             case let .ready(transcript):
                 self.transcriptView.placeholder = nil
+                if let start = self.transcriptLoadingStartTime, CACurrentMediaTime() - start > 0.5 {
+                    self.showFreeTranscriptionTooltip()
+                }
+                self.transcriptLoadingStartTime = nil
                 if let status = self.statusValue {
                     self.transcriptView.currentTime = self.currentTime(status: status)
                 }
@@ -1054,6 +1325,13 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     }
 
     func containerLayoutUpdated(_ layout: ContainerViewLayout, transition: ContainedViewLayoutTransition) {
+        // While the search is open or opening, a change of the keyboard is not a reason to lay the whole sheet out again (the header
+        // and the tabs are glass views that are expensive to update); only the inset of the list follows it.
+        if let previous = self.validLayout, self.isSearching || self.searchProgress > 0.001, previous.size == layout.size, previous.intrinsicInsets == layout.intrinsicInsets, previous.safeInsets == layout.safeInsets, previous.statusBarHeight == layout.statusBarHeight {
+            self.validLayout = layout
+            self.applyGeometry()
+            return
+        }
         self.validLayout = layout
         let theme = self.presentationData.theme
 
@@ -1164,7 +1442,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
                     HorizontalTabsComponent.Tab(
                         id: AnyHashable(Tab.transcript.rawValue),
                         content: .custom(AnyComponent(VoiceTranscriptTabContentComponent(
-                            title: "Transcript",
+                            title: self.presentationData.strings.VoiceTranscript_Transcript,
                             usesTranscriptGlyph: true,
                             iconSymbol: nil,
                             iconColor: self.selectedTab == .transcript ? voiceTranscriptBlue(theme) : theme.list.itemPrimaryTextColor,
@@ -1178,7 +1456,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
                     HorizontalTabsComponent.Tab(
                         id: AnyHashable(Tab.summary.rawValue),
                         content: .custom(AnyComponent(VoiceTranscriptTabContentComponent(
-                            title: "AI Summary",
+                            title: self.presentationData.strings.VoiceTranscript_AISummary,
                             usesTranscriptGlyph: false,
                             iconSymbol: "sparkles",
                             iconColor: self.selectedTab == .summary ? voiceTranscriptBlue(theme) : theme.list.itemPrimaryTextColor,
@@ -1211,21 +1489,15 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             transition.updateFrame(view: tabsView, frame: CGRect(origin: CGPoint(), size: tabsFrame.size))
         }
 
-        let isSearching = self.isSearching
-        self.headerButtons.view?.isHidden = isSearching
-        self.title.view?.isHidden = isSearching
-        self.tabsBackgroundContainer.isHidden = isSearching
         self.applyPageVisibility()
-        if isSearching {
-            let barFrame = CGRect(x: 0.0, y: headerInset, width: width, height: 44.0)
-            let searchBar = self.ensureSearchBar()
-            transition.updateFrame(node: searchBar, frame: barFrame)
-            searchBar.updateLayout(boundingSize: barFrame.size, leftInset: 0.0, rightInset: 0.0, transition: transition)
+        if self.isSearching || self.searchProgress > 0.001 {
+            self.layoutSearchBar(width: width, transition: transition)
         }
 
         self.controlsHeight = self.controlsView.preferredHeight(bottomInset: layout.intrinsicInsets.bottom)
         self.controlsView.updateLayout(size: CGSize(width: width, height: self.controlsHeight), bottomInset: layout.intrinsicInsets.bottom)
-        self.listTop = isSearching ? headerInset + 44.0 + 12.0 : tabsY + tabsHeight + 8.0
+        self.listTop = tabsY + tabsHeight + 8.0
+        self.listTopSearch = headerInset + 44.0 + 8.0
 
         self.applyGeometry()
     }
@@ -1263,17 +1535,47 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         CATransaction.commit()
         self.grabberNode.frame = CGRect(origin: CGPoint(x: floor((sheetFrame.width - 36.0) / 2.0), y: 5.0), size: CGSize(width: 36.0, height: 6.0))
 
+        let search = min(1.0, max(0.0, self.searchProgress))
         let controlsFrame = CGRect(origin: CGPoint(x: 0.0, y: sheetFrame.height - self.controlsHeight), size: CGSize(width: self.contentWidth, height: self.controlsHeight))
-        self.place(self.controlsView, in: controlsFrame)
+        // The player slides down and fades while the search opens.
+        self.place(self.controlsView, in: controlsFrame.offsetBy(dx: 0.0, dy: search * 36.0))
+        self.controlsView.alpha = max(0.0, 1.0 - search * 2.0)
+        // The header and the tabs fade out and the search bar fades in, in the place of the header.
+        let headerAlpha = max(0.0, 1.0 - search * 2.5)
+        let isSearchOpen = search >= 0.999
+        self.headerButtons.view?.alpha = headerAlpha
+        self.headerButtons.view?.isHidden = isSearchOpen
+        self.title.view?.alpha = headerAlpha
+        self.title.view?.isHidden = isSearchOpen
+        self.tabsBackgroundContainer.alpha = headerAlpha
+        self.tabsBackgroundContainer.isHidden = isSearchOpen
+        if let searchBarView = self.searchBar?.view {
+            searchBarView.alpha = min(1.0, max(0.0, (search - 0.25) / 0.75))
+            searchBarView.isHidden = search <= 0.001
+        }
         let syncSize = self.syncButton.preferredSize
         self.place(self.syncButton, in: CGRect(x: floor((self.contentWidth - syncSize.width) / 2.0), y: controlsFrame.minY - syncSize.height - 12.0, width: syncSize.width, height: syncSize.height))
         let buttonInset = VoiceTranscriptScreenNode.closeButtonInset
         let buttonHeight = VoiceTranscriptScreenNode.closeButtonHeight
         self.place(self.closeButton, in: CGRect(x: buttonInset, y: sheetFrame.height - buttonHeight - buttonInset, width: max(0.0, self.contentWidth - buttonInset * 2.0), height: buttonHeight))
+        // The fade starts 36pt above the button and covers the space under it, like the one under the fixed buttons of other sheets.
+        let edgeHeight = buttonHeight + 36.0
+        let edgeFrame = CGRect(x: 0.0, y: sheetFrame.height - edgeHeight - buttonInset, width: self.contentWidth, height: edgeHeight + buttonInset)
+        self.place(self.summaryEdgeEffect, in: edgeFrame)
+        if self.summaryEdgeEffectSize != edgeFrame.size {
+            self.summaryEdgeEffectSize = edgeFrame.size
+            self.summaryEdgeEffect.update(content: self.presentationData.theme.list.modalBlocksBackgroundColor, blur: true, alpha: 1.0, rect: edgeFrame, edge: .bottom, edgeSize: edgeHeight, transition: .immediate)
+        }
 
-        let isSearching = self.isSearching
-        let listBottom = isSearching ? sheetFrame.height - (layout.inputHeight ?? 0.0) : controlsFrame.minY
-        let listFrame = CGRect(origin: CGPoint(x: 0.0, y: self.listTop), size: CGSize(width: self.contentWidth, height: max(0.0, listBottom - self.listTop)))
+        // The list moves up under the search bar and grows down to the keyboard (or the bottom of the sheet) as the search opens.
+        // The list goes down to the bottom of the sheet; the keyboard is only an inset of its content, so that the list is not
+        // resized (and its text is not laid out again) while the keyboard comes or goes.
+        let searchListBottom = sheetFrame.height
+        self.transcriptView.keyboardInset = search > 0.001 || self.isSearching ? (layout.inputHeight ?? 0.0) : 0.0
+        self.transcriptView.setSearchProgress(search)
+        let listTop = self.listTop + (self.listTopSearch - self.listTop) * search
+        let listBottom = controlsFrame.minY + (searchListBottom - controlsFrame.minY) * search
+        let listFrame = CGRect(origin: CGPoint(x: 0.0, y: listTop), size: CGSize(width: self.contentWidth, height: max(0.0, listBottom - listTop)))
         self.place(self.transcriptView, in: listFrame)
         self.transcriptView.updateLayout(size: listFrame.size)
         let summaryFrame = CGRect(origin: CGPoint(x: 0.0, y: self.listTop), size: CGSize(width: self.contentWidth, height: sheetFrame.height - self.listTop))
@@ -1282,6 +1584,9 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     }
 
     func animateIn() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.prepareSearchBar()
+        }
         self.layer.animateBoundsOriginYAdditive(from: -self.bounds.size.height, to: 0.0, duration: 0.3, timingFunction: kCAMediaTimingFunctionSpring)
         self.dimNode.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
         self.dimNode.layer.animatePosition(from: CGPoint(x: 0.0, y: -self.bounds.size.height), to: CGPoint(), duration: 0.3, timingFunction: kCAMediaTimingFunctionSpring, removeOnCompletion: true, additive: true)
@@ -1291,6 +1596,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         // Nothing else may compete with the slide: stop the transcript ticks and any touches.
         self.displayLinkTimer?.invalidate()
         self.displayLinkTimer = nil
+        self.searchAnimation = nil
         self.stopExpansionAnimation()
         self.view.isUserInteractionEnabled = false
         self.searchBar?.deactivate(clear: false)
@@ -1459,6 +1765,23 @@ private final class VoiceTranscriptViewContextSource: ContextReferenceContentSou
     }
 }
 
+private final class VoiceTranscriptItemContextSource: ContextReferenceContentSource {
+    private let referenceView: UIView
+
+    init(referenceView: UIView) {
+        self.referenceView = referenceView
+    }
+
+    func transitionInfo() -> ContextControllerReferenceViewInfo? {
+        // Two items of the menu are about 110pt tall; the menu goes right under the item when it fits between the item and the bottom
+        // of the safe area, and above the item otherwise.
+        let frame = self.referenceView.convert(self.referenceView.bounds, to: nil)
+        let bottomInset = self.referenceView.window?.safeAreaInsets.bottom ?? 0.0
+        let position: ContextControllerReferenceViewInfo.ActionsPosition = frame.maxY + 130.0 <= UIScreen.main.bounds.height - bottomInset ? .bottom : .top
+        return ContextControllerReferenceViewInfo(referenceView: self.referenceView, contentAreaInScreenSpace: UIScreen.main.bounds, actionsPosition: position)
+    }
+}
+
 private final class VoiceTranscriptRateContextSource: ContextReferenceContentSource {
     private let controller: ViewController
     private let sourceNode: ContextReferenceContentNode
@@ -1517,7 +1840,10 @@ private final class VoiceTranscriptSyncButton: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(textColor: UIColor, isDark: Bool) {
+    func configure(title: String, textColor: UIColor, isDark: Bool) {
+        self.label.text = title
+        let textWidth = ceil(self.label.sizeThatFits(CGSize(width: 1000.0, height: 100.0)).width)
+        self.preferredSize = CGSize(width: VoiceTranscriptSyncButton.sidePadding * 2.0 + VoiceTranscriptSyncButton.iconSize + VoiceTranscriptSyncButton.iconGap + textWidth, height: 36.0)
         self.isDark = isDark
         self.iconView.tintColor = textColor
         self.label.textColor = textColor
@@ -1763,7 +2089,8 @@ private final class VoiceTranscriptRowView: UIView, UITextViewDelegate, UIGestur
             if isPast {
                 attributes[.foregroundColor] = played
             } else if activeIndex < 0 {
-                attributes[.foregroundColor] = upcoming
+                // While searching every line is dark (nothing is being spoken, and the matches have to be easy to read).
+                attributes[.foregroundColor] = self.isSearchMode ? activeLine : upcoming
             } else if index == activeIndex {
                 attributes[.foregroundColor] = UIColor(rgb: 0xF0F0F5)
             } else {
@@ -2000,6 +2327,8 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
 
     var seekTo: ((Double) -> Void)?
     var requestReply: ((String, String) -> Void)?
+    /// A selection is to be translated: the text of it.
+    var requestTranslate: ((String) -> Void)?
     var consumeScroll: ((CGFloat) -> CGFloat)?
     var scrollEnded: (() -> Bool)?
     private var isAdjustingOffset = false
@@ -2016,13 +2345,20 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
         }
     }
 
+    /// What the list says instead of the general "not available" (the free transcriptions are used up).
+    var unavailableMessage: String? {
+        didSet {
+            self.updatePlaceholder()
+        }
+    }
+
     private func updatePlaceholder() {
         switch self.placeholder {
         case .loading:
             self.placeholderLabel.isHidden = true
             self.skeletonNode.view.isHidden = false
         case .unavailable:
-            self.placeholderLabel.text = "Transcript is not available for this voice message"
+            self.placeholderLabel.text = self.unavailableMessage ?? self.presentationData?.strings.VoiceTranscript_TranscriptUnavailable ?? "Transcript is not available for this voice message"
             self.placeholderLabel.isHidden = false
             self.skeletonNode.view.isHidden = true
         case nil:
@@ -2149,7 +2485,7 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
         self.scrollView.bringSubviewToFront(self.endHandle)
     }
 
-    /// The menu for a selection is the system's horizontal one: Quote, Copy and Translate. Translate is not wired up yet.
+    /// The menu for a selection is the system's horizontal one: Quote, Copy and Translate.
     private func presentMenu() {
         guard let target = self.selectionTargetRect() else {
             return
@@ -2210,7 +2546,13 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
             UIPasteboard.general.string = selected.text
             self.clearSelection()
         }
-        let translate = UIAction(title: strings.Conversation_ContextMenuTranslate) { _ in
+        // Translate opens the translator of the app (the same popup as for the whole transcript) with the selected text in it.
+        let translate = UIAction(title: strings.Conversation_ContextMenuTranslate) { [weak self] _ in
+            guard let self, let selected = self.selectedTextAndTimes() else {
+                return
+            }
+            self.requestTranslate?(selected.text)
+            self.clearSelection()
         }
         return UIMenu(children: [quote, copy, translate])
     }
@@ -2422,6 +2764,33 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
         didSet {
             for row in self.rows {
                 row.isSearchMode = self.isSearchMode
+            }
+        }
+    }
+
+    private var lastSearchProgress: CGFloat = 0.0
+
+    /// While the search is open the text has no fade at its top edge; the fade goes away as the search opens.
+    func setSearchProgress(_ progress: CGFloat) {
+        if progress == self.lastSearchProgress {
+            return
+        }
+        self.lastSearchProgress = progress
+        guard let mask = self.layer.mask as? CAGradientLayer else {
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mask.locations = [0.0, NSNumber(value: Double(0.06 * (1.0 - progress))), 0.9, 1.0]
+        CATransaction.commit()
+    }
+
+    /// The height of the keyboard while searching: the end of the text can be scrolled above it.
+    var keyboardInset: CGFloat = 0.0 {
+        didSet {
+            if self.keyboardInset != oldValue {
+                self.scrollView.contentInset.bottom = self.keyboardInset
+                self.scrollView.verticalScrollIndicatorInsets.bottom = self.keyboardInset
             }
         }
     }
@@ -2776,8 +3145,35 @@ private final class VoiceSummaryTickButton: UIButton {
     }
 }
 
+/// The base size of the text of lists for the text size the user has chosen (17 for the usual one), as the lists of settings use it.
+private func voiceSummaryBaseFontSize(_ fontSize: PresentationFontSize) -> CGFloat {
+    switch fontSize {
+    case .extraSmall:
+        return 14.0
+    case .small:
+        return 15.0
+    case .medium:
+        return 16.0
+    case .regular:
+        return 17.0
+    case .large:
+        return 19.0
+    case .extraLarge:
+        return 23.0
+    case .extraLargeX2:
+        return 26.0
+    }
+}
+
 private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
     private let theme: PresentationTheme
+    private let strings: PresentationStrings
+    private let baseFontSize: CGFloat
+
+    /// A size from the design (made for the usual text size of 17) at the text size the user has chosen, whole points.
+    private func scaled(_ size: CGFloat) -> CGFloat {
+        return floor(self.baseFontSize * size / 17.0)
+    }
     private let scrollView = UIScrollView()
     private var isUserScrolling = false
 
@@ -2794,32 +3190,77 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         var time: Double?
         var taskIndex: Int?
         var isQuestion = false
+        /// A tap on the row opens a menu (Reply, Copy); the time at its start is what seeks.
+        var showsMenu = false
     }
 
     /// Which tasks are ticked. Kept here, so a tick survives the view being laid out again.
     private var taskStates: [Bool] = []
     private var taskTexts: [String] = []
+    /// Whether the whole headline is shown, when it is longer than three lines.
+    private var isHeadlineExpanded = false
+    private weak var headlineContainer: UIView?
+    private weak var headlineLabel: UILabel?
+    private weak var headlineMoreButton: UIButton?
+    private var foldedHeadlineSize = CGSize()
+    private var fullHeadlineSize = CGSize()
 
     /// The ticks outlive the sheet: they are saved by the text of the task, and read back when the summary is shown again.
     var loadTaskStates: (() -> [String: Bool])?
     var saveTaskStates: (([String: Bool]) -> Void)?
     /// A tap on a question: the chat is opened with the question quoted in the reply.
-    var questionTapped: ((String) -> Void)?
+    /// A tap on a key point or a question: the view to anchor the menu to (the text of the item), a function that shows the row as active
+    /// while its menu is open, the text, and the time of the item.
+    var itemMenuRequested: ((UIView, @escaping (Bool) -> Void, String, Double) -> Void)?
 
     /// While the summary is made the tab shows a skeleton, then the summary, or that there is none.
     var state: VoiceSummaryState = .loading {
         didSet {
+            self.isHeadlineExpanded = false
             if case let .ready(summary) = self.state {
                 let saved = self.loadTaskStates?() ?? [:]
                 self.taskTexts = summary.tasks.map { $0.text }
                 self.taskStates = summary.tasks.map { saved[$0.text] ?? $0.isCompleted }
             }
             self.rebuild(animated: true)
+            self.stateChanged?()
         }
     }
 
-    init(theme: PresentationTheme) {
+    /// Called when the state changes (the button under the summary shows Share only for a real summary).
+    var stateChanged: (() -> Void)?
+    /// Called after the text of a card was copied, so the screen can say so.
+    var copied: (() -> Void)?
+
+    /// The summary as text to send, with the tasks as they are ticked now. Nil unless a real summary is shown: a placeholder
+    /// is not a summary of anything, and is never shared.
+    var shareableText: String? {
+        guard case let .ready(summary) = self.state, !summary.isPlaceholder else {
+            return nil
+        }
+        var parts: [String] = []
+        if !summary.headline.isEmpty {
+            parts.append(summary.headline)
+        }
+        if !summary.keyPoints.isEmpty {
+            parts.append(self.strings.VoiceTranscript_KeyPoints + "\n" + summary.keyPoints.map { "\(formatVoiceTranscriptTime($0.time)) \u{2014} \($0.text)" }.joined(separator: "\n"))
+        }
+        if !summary.tasks.isEmpty {
+            parts.append(self.strings.VoiceTranscript_Tasks + "\n" + summary.tasks.enumerated().map { index, task in
+                let isDone = index < self.taskStates.count ? self.taskStates[index] : task.isCompleted
+                return (isDone ? "\u{2611} " : "\u{2610} ") + task.text
+            }.joined(separator: "\n"))
+        }
+        if !summary.questions.isEmpty {
+            parts.append(self.strings.VoiceTranscript_Questions + "\n" + summary.questions.map { "\(formatVoiceTranscriptTime($0.time)) \u{2014} \($0.text)" }.joined(separator: "\n"))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    init(theme: PresentationTheme, strings: PresentationStrings, baseFontSize: CGFloat) {
         self.theme = theme
+        self.strings = strings
+        self.baseFontSize = baseFontSize
         super.init(frame: CGRect())
         self.scrollView.delegate = self
         self.scrollView.alwaysBounceVertical = true
@@ -2828,8 +3269,27 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         // The same fade at the top edge as the transcript has, so the content goes under the tabs.
         let mask = CAGradientLayer()
         mask.colors = [UIColor.clear.cgColor, UIColor.black.cgColor, UIColor.black.cgColor]
-        mask.locations = [0.0, 0.06, 1.0]
+        // The fade at the top edge grows with the scrolling: there is none when the tab is at its top.
+        mask.locations = [0.0, 0.0, 1.0]
         self.layer.mask = mask
+    }
+
+    private var lastTopFade: CGFloat = 0.0
+
+    /// The fade at the top edge follows the scroll offset: nothing at the top, the full fade after 30pt of scrolling, smoothly between.
+    private func updateTopFade() {
+        let fade = min(1.0, max(0.0, self.scrollView.contentOffset.y / 30.0))
+        if abs(fade - self.lastTopFade) < 0.002 {
+            return
+        }
+        self.lastTopFade = fade
+        guard let mask = self.layer.mask as? CAGradientLayer else {
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mask.locations = [0.0, NSNumber(value: Double(0.06 * fade)), 1.0]
+        CATransaction.commit()
     }
 
     required init?(coder: NSCoder) {
@@ -2837,6 +3297,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        self.updateTopFade()
         if self.isAdjustingOffset || !scrollView.isDragging {
             return
         }
@@ -2916,6 +3377,42 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         }
     }
 
+    /// Opens or folds the headline in place: the container grows or shrinks, and every view under it moves by the same distance
+    /// in the same animation, so nothing is built again and nothing jumps.
+    private func toggleHeadline() {
+        guard let container = self.headlineContainer, let label = self.headlineLabel else {
+            return
+        }
+        self.isHeadlineExpanded = !self.isHeadlineExpanded
+        let expanded = self.isHeadlineExpanded
+        let targetHeight = expanded ? self.fullHeadlineSize.height : self.foldedHeadlineSize.height
+        let delta = targetHeight - container.frame.height
+        let threshold = container.frame.maxY - 0.5
+        let below = self.scrollView.subviews.filter { $0 !== container && $0.frame.minY >= threshold }
+
+        // The whole text is laid out for the length of the animation, so it is revealed (or covered) by the container alone.
+        label.numberOfLines = 0
+        label.frame = CGRect(origin: CGPoint(), size: self.fullHeadlineSize)
+        UIView.performWithoutAnimation {
+            self.headlineMoreButton?.setTitle(expanded ? self.strings.VoiceTranscript_Less : self.strings.VoiceTranscript_More, for: .normal)
+            self.headlineMoreButton?.layoutIfNeeded()
+        }
+        let contentHeight = self.scrollView.contentSize.height
+        UIView.animate(withDuration: 0.35, delay: 0.0, usingSpringWithDamping: 1.0, initialSpringVelocity: 0.0, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
+            container.frame.size.height = targetHeight
+            for view in below {
+                view.frame.origin.y += delta
+            }
+            self.scrollView.contentSize = CGSize(width: self.scrollView.contentSize.width, height: contentHeight + delta)
+        }, completion: { [weak self, weak label] _ in
+            // Folded again: the third line gets its dots back.
+            if let self, let label, !self.isHeadlineExpanded {
+                label.numberOfLines = 3
+                label.frame = CGRect(origin: CGPoint(), size: self.foldedHeadlineSize)
+            }
+        })
+    }
+
     private func buildContent(_ summary: VoiceSummary) {
         for view in self.scrollView.subviews {
             view.removeFromSuperview()
@@ -2926,36 +3423,90 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         let innerWidth = width - sideInset * 2.0
         var y: CGFloat = 20.0
 
-        // The headline is at most three lines.
-        let headline = self.label(summary.headline, font: Font.semibold(22.0), color: self.theme.list.itemPrimaryTextColor)
+        // The headline shows three lines. When it is longer, "more" opens all of it, and "less" folds it again; the text is
+        // revealed by a container that grows, and everything under it moves by the same amount, in one animation.
+        // A microphone and a space in front of the headline: it is what the voice message says.
+        let headline = self.label("\u{1F399}\u{FE0F} " + summary.headline, font: Font.semibold(22.0), color: self.theme.list.itemPrimaryTextColor)
+        let headlineConstraint = CGSize(width: innerWidth - 8.0, height: .greatestFiniteMagnitude)
+        headline.numberOfLines = 0
+        let fullHeadlineSize = headline.sizeThatFits(headlineConstraint)
         headline.numberOfLines = 3
-        let headlineSize = headline.sizeThatFits(CGSize(width: innerWidth - 8.0, height: .greatestFiniteMagnitude))
-        headline.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: headlineSize)
-        self.scrollView.addSubview(headline)
+        let foldedHeadlineSize = headline.sizeThatFits(headlineConstraint)
+        let isHeadlineLong = fullHeadlineSize.height > foldedHeadlineSize.height + 1.0
+        let showsFullHeadline = !isHeadlineLong || self.isHeadlineExpanded
+        if showsFullHeadline {
+            headline.numberOfLines = 0
+        }
+        let headlineSize = showsFullHeadline ? fullHeadlineSize : foldedHeadlineSize
+        let headlineContainer = UIView()
+        headlineContainer.clipsToBounds = true
+        headlineContainer.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: CGSize(width: headlineSize.width, height: headlineSize.height))
+        headline.frame = CGRect(origin: CGPoint(), size: headlineSize)
+        headlineContainer.addSubview(headline)
+        self.scrollView.addSubview(headlineContainer)
+        self.headlineContainer = headlineContainer
+        self.headlineLabel = headline
+        self.foldedHeadlineSize = foldedHeadlineSize
+        self.fullHeadlineSize = fullHeadlineSize
         y += headlineSize.height + 6.0
 
-        let source = self.label("Cocoon AI Summary", font: Font.regular(13.0), color: self.theme.list.itemSecondaryTextColor)
-        source.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: CGSize(width: innerWidth, height: 18.0))
+        let moreWidth: CGFloat = isHeadlineLong ? 60.0 : 0.0
+        let source = self.label(self.strings.VoiceTranscript_SummarySource, font: Font.regular(15.0), color: self.theme.list.itemSecondaryTextColor)
+        source.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: CGSize(width: innerWidth - moreWidth, height: 20.0))
         self.scrollView.addSubview(source)
-        y += 18.0 + 24.0
+        if isHeadlineLong {
+            let moreButton = UIButton(type: .system)
+            moreButton.titleLabel?.font = Font.regular(15.0)
+            moreButton.setTitle(self.isHeadlineExpanded ? self.strings.VoiceTranscript_Less : self.strings.VoiceTranscript_More, for: .normal)
+            moreButton.tintColor = voiceTranscriptBlue(self.theme)
+            moreButton.contentHorizontalAlignment = .right
+            moreButton.frame = CGRect(x: sideInset + innerWidth - moreWidth, y: y - 4.0, width: moreWidth, height: 28.0)
+            moreButton.addAction(UIAction { [weak self] _ in
+                self?.toggleHeadline()
+            }, for: .touchUpInside)
+            self.scrollView.addSubview(moreButton)
+            self.headlineMoreButton = moreButton
+        } else {
+            self.headlineMoreButton = nil
+        }
+        y += 20.0 + 32.0
 
-        // Each kind appears only when the summary has something of it.
+        // What follows a card, as in the lists of settings: the text under the section (7pt under the card, 7pt of its own below), and
+        // then 28pt before the next section.
+        func finishSection(hint: String) {
+            let hintLabel = self.label(hint, font: Font.regular(self.scaled(13.0)), color: self.theme.list.freeTextColor)
+            let hintSize = hintLabel.sizeThatFits(CGSize(width: innerWidth - 32.0, height: .greatestFiniteMagnitude))
+            hintLabel.frame = CGRect(origin: CGPoint(x: sideInset + 16.0, y: y + 7.0), size: hintSize)
+            self.scrollView.addSubview(hintLabel)
+            y += 7.0 + hintSize.height + 7.0 + 28.0
+        }
+
+        // Each kind appears only when the summary has something of it. The order is key points, tasks, questions.
         if !summary.keyPoints.isEmpty {
-            y = self.addCard(title: "Key points", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.keyPoints.map { point in
-                return Row(text: point.text, time: point.time, taskIndex: nil)
+            y = self.addCard(title: self.strings.VoiceTranscript_KeyPoints, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.keyPoints.map { point in
+                return Row(text: point.text, time: point.time, taskIndex: nil, showsMenu: true)
             })
+            finishSection(hint: self.strings.VoiceTranscript_ItemsHint)
         }
 
         if !summary.tasks.isEmpty {
-            y = self.addCard(title: "Tasks", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.tasks.enumerated().map { index, task in
+            y = self.addCard(title: self.strings.VoiceTranscript_Tasks, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.tasks.enumerated().map { index, task in
                 return Row(text: task.text, time: nil, taskIndex: index)
+            }, copyText: { [weak self] in
+                // The tasks as they are ticked now.
+                return summary.tasks.enumerated().map { index, task in
+                    let isDone = (self?.taskStates.indices.contains(index) ?? false) ? (self?.taskStates[index] ?? task.isCompleted) : task.isCompleted
+                    return (isDone ? "\u{2611} " : "\u{2610} ") + task.text
+                }.joined(separator: "\n")
             })
+            finishSection(hint: self.strings.VoiceTranscript_TasksHint)
         }
 
         if !summary.questions.isEmpty {
-            y = self.addCard(title: "Questions", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.questions.map { question in
-                return Row(text: question, time: nil, taskIndex: nil, isQuestion: true)
+            y = self.addCard(title: self.strings.VoiceTranscript_Questions, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: summary.questions.map { question in
+                return Row(text: question.text, time: question.time, taskIndex: nil, isQuestion: true, showsMenu: true)
             })
+            finishSection(hint: self.strings.VoiceTranscript_ItemsHint)
         }
 
         self.scrollView.contentSize = CGSize(width: width, height: y + 80.0 + self.validBottomInset)
@@ -2965,7 +3516,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         for view in self.scrollView.subviews {
             view.removeFromSuperview()
         }
-        var message = "The summary is not available for this voice message"
+        var message = self.strings.VoiceTranscript_SummaryUnavailable
         #if DEBUG
         if let reason = voiceSummaryDebugReason {
             message += "\n\n[debug] " + reason
@@ -3008,21 +3559,21 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
         }
         y += headlineLine * 3.0 + 6.0
 
-        let source = self.label("Cocoon AI Summary", font: Font.regular(13.0), color: self.theme.list.itemSecondaryTextColor)
-        source.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: CGSize(width: innerWidth, height: 18.0))
+        let source = self.label(self.strings.VoiceTranscript_SummarySource, font: Font.regular(15.0), color: self.theme.list.itemSecondaryTextColor)
+        source.frame = CGRect(origin: CGPoint(x: sideInset + 4.0, y: y), size: CGSize(width: innerWidth, height: 20.0))
         self.scrollView.addSubview(source)
-        y += 18.0 + 24.0
+        y += 20.0 + 32.0
 
-        y = self.addSkeletonCard(title: "Key points", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
+        y = self.addSkeletonCard(title: self.strings.VoiceTranscript_KeyPoints, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
             SkeletonRow(lead: .time, lines: [1.0, 0.6]),
             SkeletonRow(lead: .time, lines: [0.9, 0.5])
         ], shapes: &shapes)
-        y = self.addSkeletonCard(title: "Tasks", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
+        y = self.addSkeletonCard(title: self.strings.VoiceTranscript_Tasks, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
             SkeletonRow(lead: .checkbox, lines: [1.0, 0.7]),
             SkeletonRow(lead: .checkbox, lines: [0.8])
         ], shapes: &shapes)
-        y = self.addSkeletonCard(title: "Questions", y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
-            SkeletonRow(lead: .none, lines: [0.9, 0.4])
+        y = self.addSkeletonCard(title: self.strings.VoiceTranscript_Questions, y: y, innerWidth: innerWidth, sideInset: sideInset, rows: [
+            SkeletonRow(lead: .time, lines: [0.9, 0.4])
         ], shapes: &shapes)
 
         let contentSize = CGSize(width: width, height: y)
@@ -3048,17 +3599,20 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
     private func addSkeletonCard(title: String, y: CGFloat, innerWidth: CGFloat, sideInset: CGFloat, rows: [SkeletonRow], shapes: inout [ShimmerEffectNode.Shape]) -> CGFloat {
         let card = UIView()
         card.backgroundColor = self.theme.list.itemModalBlocksBackgroundColor
-        card.layer.cornerRadius = 26.0
+        card.layer.cornerRadius = 30.0
+        card.layer.cornerCurve = .continuous
 
-        var cardY: CGFloat = 14.0
-        let titleLabel = self.label(title, font: Font.regular(13.0), color: self.theme.list.itemSecondaryTextColor)
+        let cardTop = y
+        var cardY: CGFloat = 17.0
+        let titleLabel = self.label(title, font: Font.semibold(self.scaled(13.0)), color: self.theme.list.itemSecondaryTextColor)
         titleLabel.frame = CGRect(origin: CGPoint(x: 16.0, y: cardY), size: CGSize(width: innerWidth - 32.0, height: 18.0))
         card.addSubview(titleLabel)
-        cardY += 18.0 + 4.0
+        // 25pt from the top of the title to the text as in Translate, and 3pt more to let the title breathe.
+        cardY += 16.0
 
         // The text of a real row is 16pt with a line about 19pt tall; the bars stand where its lines will.
-        let linePitch: CGFloat = 19.0
-        let barHeight: CGFloat = 12.0
+        let linePitch: CGFloat = Font.regular(self.scaled(17.0)).lineHeight
+        let barHeight: CGFloat = self.scaled(13.0)
         for (index, row) in rows.enumerated() {
             let hasLead: Bool
             switch row.lead {
@@ -3071,7 +3625,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
             let textWidth = innerWidth - textX - 16.0
             let textHeight = CGFloat(row.lines.count) * linePitch
             let rowHeight = max(textHeight, hasLead ? VoiceSummaryView.leftContentSize : 0.0) + VoiceSummaryView.rowTopPadding + VoiceSummaryView.rowBottomPadding
-            let rowTop = y + cardY + VoiceSummaryView.rowTopPadding
+            let rowTop = cardTop + cardY + VoiceSummaryView.rowTopPadding
 
             for (lineIndex, fraction) in row.lines.enumerated() {
                 shapes.append(.roundedRect(rect: CGRect(x: sideInset + textX, y: rowTop + CGFloat(lineIndex) * linePitch + floor((linePitch - barHeight) / 2.0), width: floor(textWidth * fraction), height: barHeight), cornerRadius: 3.0))
@@ -3093,57 +3647,59 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
                 card.addSubview(separator)
             }
         }
-        cardY += 12.0
+        cardY += 2.0
 
-        card.frame = CGRect(origin: CGPoint(x: sideInset, y: y), size: CGSize(width: innerWidth, height: cardY))
+        card.frame = CGRect(origin: CGPoint(x: sideInset, y: cardTop), size: CGSize(width: innerWidth, height: cardY))
         self.scrollView.addSubview(card)
-        return y + cardY + 16.0
+        // The next card starts 28pt under this one (the skeleton has no text between the cards).
+        return cardTop + cardY + 28.0
     }
 
-    /// The block at the start of a row (the time, or the checkbox) is 36pt wide, 4pt from the text; the checkbox itself is 22x22.
-    fileprivate static let leftBlockWidth: CGFloat = 36.0
+    /// The block at the start of a row (the time, or the checkbox) is 40pt wide, 4pt from the text; the checkbox itself is 22x22.
+    fileprivate static let leftBlockWidth: CGFloat = 40.0
     fileprivate static let leftBlockGap: CGFloat = 4.0
     fileprivate static let leftContentSize: CGFloat = 22.0
-    /// 10pt above and below the text of a row, so 10pt between the text and the line, and between the line and the next text.
-    fileprivate static let rowTopPadding: CGFloat = 10.0
-    fileprivate static let rowBottomPadding: CGFloat = 10.0
+    /// 12pt above the text of a row and 12pt under it, so 12pt between the text and the line, and between the line and the next text.
+    fileprivate static let rowTopPadding: CGFloat = 12.0
+    fileprivate static let rowBottomPadding: CGFloat = 12.0
 
     private func applyTask(completed: Bool, button: UIButton, label: UILabel) {
-        // Exactly 22x22 either way, however big the touch area around it is.
-        button.setImage(voiceTranscriptSymbolImage(completed ? "checkmark.circle.fill" : "circle", fit: VoiceSummaryView.leftContentSize, weight: .regular), for: .normal)
-        button.tintColor = completed ? voiceTranscriptBlue(self.theme) : self.theme.list.controlSecondaryColor
+        // The circle fills exactly 22x22, however big the touch area around it is.
+        button.setImage(voiceSummaryCheckboxImage(isChecked: completed, diameter: VoiceSummaryView.leftContentSize, outlineColor: self.theme.list.controlSecondaryColor, fillColor: voiceTranscriptBlue(self.theme)), for: .normal)
         label.textColor = completed ? self.theme.list.itemPrimaryTextColor.withAlphaComponent(0.4) : self.theme.list.itemPrimaryTextColor
     }
 
-    private func addCard(title: String, y: CGFloat, innerWidth: CGFloat, sideInset: CGFloat, rows: [Row]) -> CGFloat {
+    private func addCard(title: String, y: CGFloat, innerWidth: CGFloat, sideInset: CGFloat, rows: [Row], copyText: (() -> String)? = nil) -> CGFloat {
         let card = UIView()
         card.backgroundColor = self.theme.list.itemModalBlocksBackgroundColor
-        card.layer.cornerRadius = 26.0
+        card.layer.cornerRadius = 30.0
+        card.layer.cornerCurve = .continuous
         card.clipsToBounds = true
 
-        var cardY: CGFloat = 14.0
-        let titleLabel = self.label(title, font: Font.regular(13.0), color: self.theme.list.itemSecondaryTextColor)
+        let cardTop = y
+        var cardY: CGFloat = 17.0
+        let titleLabel = self.label(title, font: Font.semibold(self.scaled(13.0)), color: self.theme.list.itemSecondaryTextColor)
         titleLabel.frame = CGRect(origin: CGPoint(x: 16.0, y: cardY), size: CGSize(width: innerWidth - 32.0, height: 18.0))
         card.addSubview(titleLabel)
-        // 4pt here plus the first row's own 10pt keeps the gap under the title where it was.
-        cardY += 18.0 + 4.0
+        // 25pt from the top of the title to the text as in Translate, and 3pt more to let the title breathe.
+        cardY += 16.0
 
         // The tasks card ends with how many are done; it is kept up to date when a task is ticked.
         let hasTasks = rows.contains(where: { $0.taskIndex != nil })
-        let progressLabel = self.label("", font: Font.regular(12.0), color: voiceTranscriptTextColor(self.theme, alpha: 0.6))
+        let progressLabel = self.label("", font: Font.regular(self.scaled(14.0)), color: voiceTranscriptTextColor(self.theme, alpha: 0.6))
         let updateProgress = { [weak self, weak progressLabel] in
             guard let self else {
                 return
             }
-            progressLabel?.text = "\(self.taskStates.filter { $0 }.count) of \(self.taskStates.count) completed"
+            progressLabel?.text = self.strings.VoiceTranscript_TasksCompleted("\(self.taskStates.filter { $0 }.count)", "\(self.taskStates.count)").string
         }
         updateProgress()
 
         for (index, row) in rows.enumerated() {
-            // A row may start with a block 36pt wide (the time of a key point, the tick of a task), with 4pt between it and the text.
-            let hasLeftBlock = row.time != nil || row.taskIndex != nil
+            // A row may start with a block 40pt wide (the time of a key point, the tick of a task), with 4pt between it and the text.
+            let hasLeftBlock = row.time != nil || row.taskIndex != nil || row.isQuestion
             let textX: CGFloat = hasLeftBlock ? 16.0 + VoiceSummaryView.leftBlockWidth + VoiceSummaryView.leftBlockGap : 16.0
-            let text = self.label(row.text, font: Font.regular(16.0), color: self.theme.list.itemPrimaryTextColor)
+            let text = self.label(row.text, font: Font.regular(self.scaled(17.0)), color: self.theme.list.itemPrimaryTextColor)
             let textSize = text.sizeThatFits(CGSize(width: innerWidth - textX - 16.0, height: .greatestFiniteMagnitude))
             let blockHeight: CGFloat = hasLeftBlock ? VoiceSummaryView.leftContentSize : 0.0
             let rowHeightForButton = max(textSize.height, blockHeight) + VoiceSummaryView.rowTopPadding + VoiceSummaryView.rowBottomPadding
@@ -3151,19 +3707,32 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
             let rowButton = UIButton(type: .custom)
             rowButton.frame = CGRect(origin: CGPoint(x: 0.0, y: cardY), size: CGSize(width: innerWidth, height: rowHeightForButton))
             let highlightColor = self.theme.list.itemHighlightedBackgroundColor
-            rowButton.addAction(UIAction { [weak rowButton] _ in
-                rowButton?.backgroundColor = highlightColor
-            }, for: .touchDown)
-            rowButton.addAction(UIAction { [weak rowButton] _ in
-                rowButton?.backgroundColor = nil
-            }, for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
+            if !row.showsMenu {
+                rowButton.addAction(UIAction { [weak rowButton] _ in
+                    rowButton?.backgroundColor = highlightColor
+                }, for: .touchDown)
+                rowButton.addAction(UIAction { [weak rowButton] _ in
+                    rowButton?.backgroundColor = nil
+                }, for: [.touchUpInside, .touchUpOutside, .touchCancel, .touchDragExit])
+            }
             if hasLeftBlock || row.isQuestion {
                 card.addSubview(rowButton)
             }
-            if row.isQuestion {
-                let question = row.text
-                rowButton.addAction(UIAction { [weak self] _ in
-                    self?.questionTapped?(question)
+            if row.showsMenu {
+                // A tap on a key point or a question opens a menu: reply to it in the chat, or copy it.
+                let rowText = row.text
+                let rowTime = row.time ?? 0.0
+                rowButton.addAction(UIAction { [weak self, weak text] _ in
+                    guard let text else {
+                        return
+                    }
+                    // The text is shown at 60% while its menu is open, and the menu is anchored to the text, not to the whole row.
+                    let setActive: (Bool) -> Void = { [weak text] isActive in
+                        UIView.animate(withDuration: 0.2) {
+                            text?.alpha = isActive ? 0.6 : 1.0
+                        }
+                    }
+                    self?.itemMenuRequested?(text, setActive, rowText, rowTime)
                 }, for: .touchUpInside)
             }
             // The block's content is centred on the first line of the text.
@@ -3176,7 +3745,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
 
             if let time = row.time {
                 let button = UIButton(type: .system)
-                button.titleLabel?.font = Font.regular(12.0)
+                button.titleLabel?.font = Font.regular(self.scaled(13.0))
                 button.setTitle(formatVoiceTranscriptTime(time), for: .normal)
                 button.tintColor = self.theme.list.itemAccentColor
                 button.contentHorizontalAlignment = .left
@@ -3184,11 +3753,11 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
                     self?.seekTo?(time)
                 }
                 button.addAction(seek, for: .touchUpInside)
-                rowButton.addAction(seek, for: .touchUpInside)
+                // Only the time seeks: a tap on the rest of the row opens the menu of the key point or the question.
                 button.frame = CGRect(origin: CGPoint(x: 16.0, y: blockTop), size: CGSize(width: VoiceSummaryView.leftBlockWidth, height: blockHeight))
                 card.addSubview(button)
             } else if let taskIndex = row.taskIndex {
-                // The 36pt block is the checkbox: tapping it ticks the task or takes the tick away.
+                // The 40pt block is the checkbox: tapping it ticks the task or takes the tick away.
                 let button = VoiceSummaryTickButton(type: .system)
                 button.frame = CGRect(origin: CGPoint(x: 16.0, y: blockTop), size: CGSize(width: VoiceSummaryView.leftBlockWidth, height: blockHeight))
                 button.contentHorizontalAlignment = .left
@@ -3215,7 +3784,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
             }
             cardY += rowHeight
 
-            if index != rows.count - 1 || hasTasks {
+            if index != rows.count - 1 {
                 let separator = UIView()
                 separator.backgroundColor = self.theme.list.itemPlainSeparatorColor
                 separator.frame = CGRect(origin: CGPoint(x: textX, y: cardY), size: CGSize(width: innerWidth - textX - 16.0, height: 1.0 / UIScreenScale))
@@ -3223,16 +3792,32 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
             }
         }
         if hasTasks {
-            progressLabel.frame = CGRect(origin: CGPoint(x: 16.0, y: cardY + 12.0), size: CGSize(width: innerWidth - 32.0, height: 16.0))
+            progressLabel.frame = CGRect(origin: CGPoint(x: 16.0, y: cardY + 10.0), size: CGSize(width: innerWidth - 32.0 - 44.0, height: max(16.0, ceil(progressLabel.font.lineHeight))))
             card.addSubview(progressLabel)
+            // The copy button is at the bottom right, in line with the counter, as the one of the Translate sheet is at the end of
+            // its text. The sheet stays open after the copy.
+            if let copyText {
+                let icon = generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Copy"), color: self.theme.list.itemAccentColor)
+                let iconWidth = icon?.size.width ?? 24.0
+                let copyButton = UIButton(type: .custom)
+                copyButton.setImage(icon, for: .normal)
+                copyButton.frame = CGRect(x: innerWidth - 16.0 - iconWidth / 2.0 - 22.0, y: cardY + 10.0 + 8.0 - 22.0, width: 44.0, height: 44.0)
+                copyButton.addAction(UIAction { [weak self] _ in
+                    UIPasteboard.general.string = copyText()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    self?.copied?()
+                }, for: .touchUpInside)
+                card.addSubview(copyButton)
+            }
             // 12pt between the last line and the text.
-            cardY += 12.0 + 16.0
+            cardY += 10.0 + max(16.0, ceil(progressLabel.font.lineHeight))
         }
-        cardY += 12.0
+        // 14pt under the last text, as in the blocks of the Translate screen (the last row already has 12pt of its own).
+        cardY += hasTasks ? 14.0 : 2.0
 
-        card.frame = CGRect(origin: CGPoint(x: sideInset, y: y), size: CGSize(width: innerWidth, height: cardY))
+        card.frame = CGRect(origin: CGPoint(x: sideInset, y: cardTop), size: CGSize(width: innerWidth, height: cardY))
         self.scrollView.addSubview(card)
-        return y + cardY + 16.0
+        return cardTop + cardY
     }
 }
 

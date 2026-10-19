@@ -134,11 +134,9 @@ public final class ServerVoiceTranscriptProvider: VoiceTranscriptProvider {
 
 // MARK: - Summary
 
-/// Whether the summary is asked of Telegram's AI. The first version of the request (`stylize` with our own instruction) was
-/// refused by the server with `AICOMPOSE_TONE_INVALID` on every try, so the tab fell back to placeholder text. The request is
-/// now made the way the app's own "compose with AI" does it (`generate`, the whole instruction and the transcript in the
-/// prompt), with the old way as a second try; when every try fails the tab shows the placeholder summary. See
-/// docs/voice-transcript-sheet.md.
+/// Whether the summary is asked of Telegram's AI. The request is made the way the app's own "compose with AI" does it
+/// (`generate`, with the whole instruction and the text in the prompt). When every try fails the tab shows the placeholder
+/// summary. See docs/voice-transcript-sheet.md.
 // A variable, not a constant, so that the compiler does not flag the branch it switches off as unreachable.
 private var voiceSummaryUsesAI = true
 
@@ -147,6 +145,14 @@ private let voiceSummaryFallsBackToPlaceholder = true
 
 /// How long the skeleton of the summary stays the first time a voice message is opened, when the summary is placeholder text.
 private let voiceSummaryFixedDelay = 2.0
+
+/// A prompt of our own is limited in length: the app's own prompt field takes 1000 characters, and a longer prompt is refused
+/// by the server (`AICOMPOSE_TONE_INVALID`). The instruction and the text of a request together stay under this many
+/// characters, so a long transcript is summarised in parts and the parts are put together.
+private let voiceSummaryPromptLimit = 900
+
+/// The most parts a transcript is cut into; a longer one is thinned out, with the parts spread over the whole message.
+private let voiceSummaryMaxParts = 6
 
 /// The language the transcript is in, by its English name ("Ukrainian"), or nil when it cannot be told. A model that is only
 /// told "the language of the text" answers in English all the same, so the language is named.
@@ -161,32 +167,123 @@ private func voiceSummaryLanguageName(of text: String) -> String? {
 
 /// The instruction, in the line format that is easy to read back. The answer is read line by line, so a model that adds a
 /// sentence of its own, or decorates the lines with bullets and bold, does no harm. The labels stay in English whatever the
-/// language of the text is: they are what the answer is read by.
-private func voiceSummaryInstruction(languageName: String?) -> String {
-    let language = languageName.map { "Write the text of every item in \($0), the language of the transcript" } ?? "Write the text of every item in the language of the transcript"
-    return "Summarize the voice message transcript below. \(language), but keep the labels in English. Answer with one item per line, exactly in this format: SUMMARY: one short sentence. KEY: m:ss | key point (the time of the line it comes from). TASK: a task for the listener. QUESTION: a question to answer. At most 4 of each; skip a kind if there is nothing for it."
+/// language of the text is: they are what the answer is read by. It is short on purpose (see `voiceSummaryPromptLimit`).
+private func voiceSummaryInstruction(languageName: String?, maxItems: Int) -> String {
+    let language = languageName ?? "the language of the transcript"
+    return "Summarize this voice message transcript in \(language). Reply with lines only: SUMMARY: one short sentence of at most 20 words. KEY: m:ss | key point (one point per line). TASK: a short task. QUESTION: m:ss | a question. At most \(maxItems) of each, skip a kind if empty. Keep the labels in English."
 }
 
-private enum VoiceSummaryRequestKind {
-    /// The app's "compose with AI": the prompt is the whole request, the transcript included.
-    case generate(String)
-    /// The text is rewritten by an instruction of our own (what the first version of this screen did).
-    case stylize(String)
-}
-
-/// What is tried, in order, until one of them answers. The server limits are not known (the app's own prompt field takes 1000
-/// characters), so a shorter transcript is tried when the whole one is refused.
-private func voiceSummaryRequests(input: String) -> [VoiceSummaryRequestKind] {
-    var result: [VoiceSummaryRequestKind] = []
-    let languageName = voiceSummaryLanguageName(of: input)
-    let instruction = voiceSummaryInstruction(languageName: languageName)
-    result.append(.generate(instruction + "\n\nTranscript:\n" + String(input.prefix(3000))))
-    if input.count > 600 {
-        result.append(.generate(instruction + "\n\nTranscript:\n" + String(input.prefix(600))))
+/// `limit` items spread evenly over the list (the first and the last included), or the whole list when it is short.
+private func voiceSummarySpread<T>(_ items: [T], limit: Int) -> [T] {
+    if items.count <= limit || limit < 2 {
+        return items.count <= limit ? items : Array(items.prefix(limit))
     }
-    result.append(.stylize(instruction))
-    result.append(.stylize("Summarize in one or two short sentences" + (languageName.map { ", in \($0)." } ?? ", in the language of the text.")))
-    return result
+    return (0 ..< limit).map { index in
+        return items[Int((Double(index) * Double(items.count - 1) / Double(limit - 1)).rounded())]
+    }
+}
+
+/// The prompts to ask, one for each part of the transcript, each under the limit and each with the instruction in front.
+private func voiceSummaryPrompts(lines: [String], languageName: String?) -> [String] {
+    let instruction = voiceSummaryInstruction(languageName: languageName, maxItems: 3) + "\n\nTranscript:\n"
+    let budget = max(200, voiceSummaryPromptLimit - instruction.count)
+    var chunks: [String] = []
+    var current = ""
+    for line in lines {
+        let text = line.count > budget ? String(line.prefix(budget)) : line
+        if !current.isEmpty && current.count + 1 + text.count > budget {
+            chunks.append(current)
+            current = text
+        } else {
+            current = current.isEmpty ? text : current + "\n" + text
+        }
+    }
+    if !current.isEmpty {
+        chunks.append(current)
+    }
+    return voiceSummarySpread(chunks, limit: voiceSummaryMaxParts).map { instruction + $0 }
+}
+
+/// One request to the AI: the text of the answer, or nil. A request the server refused is tried once more after a second, because
+/// the same request sometimes goes through.
+private func voiceSummaryGenerate(context: AccountContext, prompt: String) -> Signal<String?, NoError> {
+    func attempt(_ remaining: Int) -> Signal<String?, NoError> {
+        return context.engine.messages.composeAIMessage(text: .empty, mode: .generate(prompt: prompt))
+        |> map { result -> String? in
+            let text = voiceSummaryAnswerText(result.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            #if DEBUG
+            print("[VoiceSummary] answer of \(text.count) characters to a prompt of \(prompt.count):\n\(text)")
+            #endif
+            return text.isEmpty ? nil : text
+        }
+        |> `catch` { error -> Signal<String?, NoError> in
+            #if DEBUG
+            print("[VoiceSummary] a request of \(prompt.count) characters failed: \(error), the server said: \(telegramAIComposeLastErrorDescription ?? "nothing")")
+            voiceSummaryDebugReason = (voiceSummaryDebugReason.map { $0 + "\n" } ?? "") + "\(error): \(telegramAIComposeLastErrorDescription ?? "nothing")"
+            #endif
+            if case .generic = error, remaining > 0 {
+                return Signal<Void, NoError>.single(Void())
+                |> delay(1.0, queue: Queue.mainQueue())
+                |> mapToSignal { _ -> Signal<String?, NoError> in
+                    return attempt(remaining - 1)
+                }
+            }
+            return .single(nil)
+        }
+    }
+    return attempt(1)
+}
+
+/// What the AI answered, as a summary: read by its labels, or, when it did not keep to the format, the text itself as the headline.
+private func voiceSummaryFromAnswer(_ text: String) -> VoiceSummary {
+    if let summary = parseVoiceSummary(text) {
+        return summary
+    }
+    let firstLine = text.components(separatedBy: .newlines).first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? text
+    return VoiceSummary(headline: firstLine.trimmingCharacters(in: .whitespacesAndNewlines), keyPoints: [], tasks: [], questions: [])
+}
+
+/// The summaries of the parts of a transcript, put together into one: the key points in the order they are said (thinned out
+/// when there are many), the tasks and questions without repeats, and one headline for all of it.
+private func voiceSummaryCombined(context: AccountContext, summaries: [VoiceSummary], languageName: String?) -> Signal<VoiceSummary, NoError> {
+    var keyPoints: [VoiceSummary.KeyPoint] = []
+    var tasks: [VoiceSummary.Task] = []
+    var questions: [VoiceSummary.Question] = []
+    for summary in summaries {
+        for point in summary.keyPoints where !keyPoints.contains(where: { $0.text.lowercased() == point.text.lowercased() }) {
+            keyPoints.append(point)
+        }
+        for task in summary.tasks where !tasks.contains(where: { $0.text.lowercased() == task.text.lowercased() }) {
+            tasks.append(task)
+        }
+        for question in summary.questions where !questions.contains(where: { $0.text.lowercased() == question.text.lowercased() }) {
+            questions.append(question)
+        }
+    }
+    keyPoints.sort { $0.time < $1.time }
+    let finalKeyPoints = voiceSummarySpread(keyPoints, limit: 5)
+    let finalTasks = Array(tasks.prefix(5))
+    let finalQuestions = Array(questions.prefix(3))
+    let headlines = summaries.map { $0.headline }.filter { !$0.isEmpty }
+    
+    if headlines.count <= 1 {
+        return .single(VoiceSummary(headline: headlines.first ?? "", keyPoints: finalKeyPoints, tasks: finalTasks, questions: finalQuestions))
+    }
+    
+    // One headline for the whole message, from the headlines of the parts.
+    let language = languageName ?? "the language of the notes"
+    let prompt = String(("Write one short sentence in \(language) that sums up these notes about one voice message. Reply with: SUMMARY: the sentence.\n\n" + headlines.joined(separator: "\n")).prefix(voiceSummaryPromptLimit))
+    return voiceSummaryGenerate(context: context, prompt: prompt)
+    |> map { text -> VoiceSummary in
+        var headline = headlines[0]
+        if let text {
+            headline = voiceSummaryFromAnswer(text).headline
+            if headline.isEmpty {
+                headline = headlines[0]
+            }
+        }
+        return VoiceSummary(headline: headline, keyPoints: finalKeyPoints, tasks: finalTasks, questions: finalQuestions)
+    }
 }
 
 /// The text of what the AI answered, whatever form it came in (a plain message, or a rich one made of blocks).
@@ -231,17 +328,42 @@ private func voiceSummaryBlocksText(_ blocks: [InstantPageBlock]) -> String {
     return lines.filter { !$0.isEmpty }.joined(separator: "\n")
 }
 
-/// Summaries already made, so reopening the sheet does not ask again. Main thread only.
+/// Summaries the AI made, kept for each voice message (in memory and on disk), so reopening the sheet does not ask again and
+/// the same text is shown every time. Only real summaries are kept: a placeholder is never stored. Main thread only.
 private final class VoiceSummaryCache {
     static let shared = VoiceSummaryCache()
     private var values: [EngineMessage.Id: VoiceSummary] = [:]
+    /// The voice messages whose placeholder was already shown, so its skeleton is not shown a second time.
+    private var placeholdersShown = Set<EngineMessage.Id>()
+    
+    private func key(_ id: EngineMessage.Id) -> String {
+        return "voiceSummary_\(id.peerId.toInt64())_\(id.namespace)_\(id.id)"
+    }
     
     func value(for id: EngineMessage.Id) -> VoiceSummary? {
-        return self.values[id]
+        if let value = self.values[id] {
+            return value
+        }
+        if let data = UserDefaults.standard.data(forKey: self.key(id)), let value = try? JSONDecoder().decode(VoiceSummary.self, from: data) {
+            self.values[id] = value
+            return value
+        }
+        return nil
     }
     
     func set(_ summary: VoiceSummary, for id: EngineMessage.Id) {
         self.values[id] = summary
+        if let data = try? JSONEncoder().encode(summary) {
+            UserDefaults.standard.set(data, forKey: self.key(id))
+        }
+    }
+    
+    func hasShownPlaceholder(for id: EngineMessage.Id) -> Bool {
+        return self.placeholdersShown.contains(id)
+    }
+    
+    func markPlaceholderShown(for id: EngineMessage.Id) {
+        self.placeholdersShown.insert(id)
     }
 }
 
@@ -259,14 +381,40 @@ private func voiceSummaryTime(_ text: String) -> Double? {
     return Double(seconds)
 }
 
+/// The key points in one `KEY:` value that holds more than one point, each starting with its own time and a bar. Empty when
+/// the value does not have that shape.
+private func voiceSummaryKeyPoints(from value: String) -> [VoiceSummary.KeyPoint] {
+    guard let regex = try? NSRegularExpression(pattern: "(\\d{1,2}(?::\\d{2}){1,2})\\s*\\|") else {
+        return []
+    }
+    let string = value as NSString
+    let matches = regex.matches(in: value, range: NSRange(location: 0, length: string.length))
+    if matches.count < 2 {
+        return []
+    }
+    var result: [VoiceSummary.KeyPoint] = []
+    for (index, match) in matches.enumerated() {
+        let time = voiceSummaryTime(string.substring(with: match.range(at: 1))) ?? 0.0
+        let start = match.range.location + match.range.length
+        let end = index + 1 < matches.count ? matches[index + 1].range.location : string.length
+        let text = string.substring(with: NSRange(location: start, length: end - start)).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+            result.append(VoiceSummary.KeyPoint(time: time, text: text))
+        }
+    }
+    return result
+}
+
 /// Reads the answer of the model. Returns nil when it holds nothing usable.
 func parseVoiceSummary(_ text: String) -> VoiceSummary? {
     var headline = ""
     var keyPoints: [VoiceSummary.KeyPoint] = []
     var tasks: [VoiceSummary.Task] = []
-    var questions: [String] = []
+    var questions: [VoiceSummary.Question] = []
     
-    for rawLine in text.components(separatedBy: .newlines) {
+    // A model sometimes puts several items on one line; each label starts an item of its own.
+    let separated = text.replacingOccurrences(of: "\\s+(?=(?:SUMMARY|KEY|TASK|QUESTION):)", with: "\n", options: .regularExpression)
+    for rawLine in separated.components(separatedBy: .newlines) {
         var line = rawLine.replacingOccurrences(of: "**", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
         while let first = line.first, "-*•–".contains(first) {
             line.removeFirst()
@@ -284,8 +432,12 @@ func parseVoiceSummary(_ text: String) -> VoiceSummary? {
         if let value = value(after: "SUMMARY:") {
             headline = value
         } else if let value = value(after: "KEY:") {
-            // "m:ss | the point"; without a time the point points at the start.
-            if let separator = value.firstIndex(of: "|") {
+            // "m:ss | the point"; without a time the point points at the start. A model sometimes runs several points
+            // together on one line ("0:41 | a. 0:47 | b."), which are told apart by their times.
+            let points = voiceSummaryKeyPoints(from: value)
+            if points.count > 1 {
+                keyPoints.append(contentsOf: points)
+            } else if let separator = value.firstIndex(of: "|") {
                 let time = voiceSummaryTime(String(value[value.startIndex ..< separator])) ?? 0.0
                 let point = String(value[value.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if !point.isEmpty {
@@ -297,7 +449,15 @@ func parseVoiceSummary(_ text: String) -> VoiceSummary? {
         } else if let value = value(after: "TASK:") {
             tasks.append(VoiceSummary.Task(text: value, isCompleted: false))
         } else if let value = value(after: "QUESTION:") {
-            questions.append(value)
+            // "m:ss | the question"; without a time the question points at the start.
+            if let separator = value.firstIndex(of: "|"), let time = voiceSummaryTime(String(value[value.startIndex ..< separator])) {
+                let text = String(value[value.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty {
+                    questions.append(VoiceSummary.Question(time: time, text: text))
+                }
+            } else {
+                questions.append(VoiceSummary.Question(time: 0.0, text: value))
+            }
         }
     }
     
@@ -308,13 +468,15 @@ func parseVoiceSummary(_ text: String) -> VoiceSummary? {
 }
 
 extension ServerVoiceTranscriptProvider {
-    /// The fixed summary, as if it were being made: the skeleton for two seconds the first time this voice message is opened,
-    /// the summary at once afterwards.
+    private func summarySeed(messageId: EngineMessage.Id) -> UInt64 {
+        return UInt64(bitPattern: Int64(messageId.id)) &* 0x2545F4914F6CDD1D &+ UInt64(bitPattern: messageId.peerId.toInt64())
+    }
+    
+    /// The placeholder summary, as if it were being made: the skeleton for two seconds the first time this voice message is
+    /// opened, the summary at once afterwards.
     func makeFixedSummary(messageId: EngineMessage.Id, transcript: VoiceTranscript) -> Signal<VoiceSummaryState, NoError> {
-        // Placeholder content picked at random for this voice message (the same one every time it is opened).
-        let seed = UInt64(bitPattern: Int64(messageId.id)) &* 0x2545F4914F6CDD1D &+ UInt64(bitPattern: messageId.peerId.toInt64())
-        let summary = VoiceSummaryCache.shared.value(for: messageId) ?? voiceRandomSummary(seed: seed, transcript: transcript)
-        if VoiceSummaryCache.shared.value(for: messageId) != nil {
+        let summary = voiceRandomSummary(seed: self.summarySeed(messageId: messageId), transcript: transcript)
+        if VoiceSummaryCache.shared.hasShownPlaceholder(for: messageId) {
             return .single(.ready(summary))
         }
         return Signal<VoiceSummaryState, NoError>.single(.loading)
@@ -322,7 +484,7 @@ extension ServerVoiceTranscriptProvider {
             Signal<VoiceSummaryState, NoError>.single(.ready(summary))
             |> delay(voiceSummaryFixedDelay, queue: Queue.mainQueue())
             |> afterNext { _ in
-                VoiceSummaryCache.shared.set(summary, for: messageId)
+                VoiceSummaryCache.shared.markPlaceholderShown(for: messageId)
             }
         )
     }
@@ -331,12 +493,12 @@ extension ServerVoiceTranscriptProvider {
         if let cached = VoiceSummaryCache.shared.value(for: messageId) {
             return .single(.ready(cached))
         }
-        // The transcript the screen shows, with the time of each line in front of it, is what the model reads. The times it
-        // answers with are therefore the ones the lines carry, and a tap on one seeks to the line.
-        let input = transcript.segments.map { segment in
+        // The lines of the transcript the screen shows, with the time of each in front of it. The times the model answers with
+        // are therefore the ones the lines carry, and a tap on one seeks to the line.
+        let lines = transcript.segments.filter { !$0.text.isEmpty }.map { segment in
             return "[" + formatVoiceTranscriptTime(segment.start) + "] " + segment.text
-        }.joined(separator: "\n")
-        if input.isEmpty {
+        }
+        if lines.isEmpty {
             #if DEBUG
             voiceSummaryDebugReason = "the transcript has no text"
             #endif
@@ -344,91 +506,72 @@ extension ServerVoiceTranscriptProvider {
         }
         #if DEBUG
         voiceSummaryDebugReason = nil
-        print("[VoiceSummary] asking for a summary of \(input.count) characters of transcript")
         #endif
         
-        let seed = UInt64(bitPattern: Int64(messageId.id)) &* 0x2545F4914F6CDD1D &+ UInt64(bitPattern: messageId.peerId.toInt64())
-        let requests = voiceSummaryRequests(input: input)
+        let seed = self.summarySeed(messageId: messageId)
+        let languageName = voiceSummaryLanguageName(of: lines.joined(separator: " "))
+        let prompts = voiceSummaryPrompts(lines: lines, languageName: languageName)
+        #if DEBUG
+        print("[VoiceSummary] \(lines.count) lines of transcript in \(prompts.count) part(s), language: \(languageName ?? "unknown")")
+        #endif
         
-        func ask(_ index: Int) -> Signal<VoiceSummaryState, NoError> {
-            let signal: Signal<TelegramAIComposeMessageResult, TelegramAIComposeMessageError>
-            switch requests[index] {
-            case let .generate(prompt):
-                signal = context.engine.messages.composeAIMessage(text: .empty, mode: .generate(prompt: prompt))
-            case let .stylize(prompt):
-                signal = context.engine.messages.composeAIMessage(text: .plain(text: input, entities: []), mode: .stylize(emojify: false, style: .prompt(prompt)))
-            }
-            
-            // A refused or empty try goes on to the next one. Hitting the free limit is not a reason to try again.
-            func next(_ reason: String, retry: Bool) -> Signal<VoiceSummaryState, NoError> {
-                #if DEBUG
-                print("[VoiceSummary] try \(index) gave nothing: \(reason)")
-                voiceSummaryDebugReason = (voiceSummaryDebugReason.map { $0 + "\n" } ?? "") + "try \(index): \(reason)"
-                #endif
-                if retry && index + 1 < requests.count {
-                    return ask(index + 1)
-                }
-                return .single(.unavailable)
-            }
-            
-            return signal
-            |> map { result -> VoiceSummaryState? in
-                let text = voiceSummaryAnswerText(result.text).trimmingCharacters(in: .whitespacesAndNewlines)
-                #if DEBUG
-                print("[VoiceSummary] try \(index), answer of \(text.count) characters:\n\(text)")
-                #endif
-                if text.isEmpty {
-                    return nil
-                }
-                if let summary = parseVoiceSummary(text) {
-                    return .ready(summary)
-                }
-                // The model did not keep to the format: what it wrote is shown as the headline, rather than nothing.
-                return .ready(VoiceSummary(headline: text, keyPoints: [], tasks: [], questions: []))
-            }
-            |> mapToSignal { state -> Signal<VoiceSummaryState, TelegramAIComposeMessageError> in
-                if let state {
-                    return .single(state)
-                }
-                return .fail(.generic)
-            }
-            |> `catch` { error -> Signal<VoiceSummaryState, NoError> in
-                #if DEBUG
-                let serverText = telegramAIComposeLastErrorDescription ?? "nothing"
-                #else
-                let serverText = ""
-                #endif
-                if case .nonPremiumFlood = error {
-                    return next("free limit reached", retry: false)
-                }
-                return next("\(error), the server said: \(serverText)", retry: true)
+        // Every part is summarised on its own (each prompt stays under the limit), then the results are put together. Parts the
+        // server refused are left out; the summary is made of the others.
+        let partRequests: [Signal<VoiceSummary?, NoError>] = prompts.map { prompt in
+            return voiceSummaryGenerate(context: context, prompt: prompt)
+            |> map { text -> VoiceSummary? in
+                return text.map { voiceSummaryFromAnswer($0) }
             }
         }
         
-        let request = ask(0)
+        // When no part gets through, the old way is tried once: the transcript as the text, the instruction as the tone.
+        func rewriteFallback() -> Signal<VoiceSummaryState, NoError> {
+            let input = lines.joined(separator: "\n")
+            let instruction = voiceSummaryInstruction(languageName: languageName, maxItems: 4)
+            return context.engine.messages.composeAIMessage(text: .plain(text: input, entities: []), mode: .stylize(emojify: false, style: .prompt(instruction)))
+            |> map { result -> VoiceSummaryState in
+                let text = voiceSummaryAnswerText(result.text).trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty {
+                    return .unavailable
+                }
+                return .ready(voiceSummaryFromAnswer(text))
+            }
+            |> `catch` { _ -> Signal<VoiceSummaryState, NoError> in
+                return .single(.unavailable)
+            }
+        }
+        
+        let request: Signal<VoiceSummaryState, NoError> = combineLatest(partRequests)
+        |> take(1)
+        |> mapToSignal { results -> Signal<VoiceSummaryState, NoError> in
+            let summaries = results.compactMap { $0 }
+            if summaries.isEmpty {
+                return rewriteFallback()
+            }
+            return voiceSummaryCombined(context: context, summaries: summaries, languageName: languageName)
+            |> map { summary -> VoiceSummaryState in
+                return .ready(summary)
+            }
+        }
         // A request that never answers must not leave the tab on its skeleton forever.
-        |> timeout(60.0, queue: Queue.mainQueue(), alternate: Signal<VoiceSummaryState, NoError>.single(.unavailable) |> afterNext { _ in
+        |> timeout(90.0, queue: Queue.mainQueue(), alternate: Signal<VoiceSummaryState, NoError>.single(.unavailable) |> afterNext { _ in
             #if DEBUG
-            print("[VoiceSummary] no answer in 60 seconds")
-            voiceSummaryDebugReason = "no answer in 60 seconds"
+            print("[VoiceSummary] no answer in 90 seconds")
+            voiceSummaryDebugReason = "no answer in 90 seconds"
             #endif
         })
         |> deliverOnMainQueue
         |> map { state -> VoiceSummaryState in
-            switch state {
-            case let .ready(summary):
+            if case let .ready(summary) = state {
                 // Whatever the model left out is filled from the transcript, so the tab is never half empty.
                 let completed = voiceCompletedSummary(summary, transcript: transcript, seed: seed)
                 VoiceSummaryCache.shared.set(completed, for: messageId)
                 return .ready(completed)
-            default:
-                if voiceSummaryFallsBackToPlaceholder {
-                    let placeholder = voiceRandomSummary(seed: seed, transcript: transcript)
-                    VoiceSummaryCache.shared.set(placeholder, for: messageId)
-                    return .ready(placeholder)
-                }
-                return state
             }
+            if voiceSummaryFallsBackToPlaceholder {
+                return .ready(voiceRandomSummary(seed: seed, transcript: transcript))
+            }
+            return state
         }
         
         return Signal<VoiceSummaryState, NoError>.single(.loading)
