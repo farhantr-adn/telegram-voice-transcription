@@ -137,10 +137,11 @@ diff --git a/submodules/AccountContext/Sources/ChatController.swift b/submodules
 index 57d02ca..8703d23 100644
 --- a/submodules/AccountContext/Sources/ChatController.swift
 +++ b/submodules/AccountContext/Sources/ChatController.swift
-@@ -1238,6 +1238,10 @@ public protocol ChatController: ViewController {
+@@ -1238,6 +1238,11 @@ public protocol ChatController: ViewController {
      func removeAd(opaqueId: Data)
      
      func restrictedSendingContentsText() -> String
++    var accountId: AccountRecordId { get }
 +
 +    /// Puts a reply to the message in the input panel and focuses the input, as the Reply action of the message's menu does.
 +    /// Returns false, and does nothing, when the message is not in the part of the history that is loaded.
@@ -699,7 +700,7 @@ index a017f15..2e41c14 100644
              if let messageId = messageId {
 +                // Consume only at the explicit transcript Quote action's reply setup, not at send time.
 +                // Both setupReply(toMessageId:) and the asynchronous history setupReply callback land here.
-+                let voiceFragment = VoiceReplyFragmentStore.shared.take(for: messageId)
++                let voiceFragment = VoiceReplyFragmentStore.shared.take(for: messageId, accountId: strongSelf.context.account.id.int64)
 +                if voiceFragment != nil {
 +                    guard messageId.peerId.namespace != Namespaces.Peer.SecretChat,
 +                          let message = strongSelf.chatDisplayNode.historyNode.messageInCurrentHistoryView(messageId)?._asMessage(),
@@ -811,10 +812,14 @@ diff --git a/submodules/TelegramUI/Sources/ChatController.swift b/submodules/Tel
 index 88472a6..fb2e4f8 100644
 --- a/submodules/TelegramUI/Sources/ChatController.swift
 +++ b/submodules/TelegramUI/Sources/ChatController.swift
-@@ -11045,6 +11045,15 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
+@@ -11045,6 +11045,19 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
          transition.updateSublayerTransformScale(node: self.chatDisplayNode.historyNode, scale: scale)
      }
      
++    public var accountId: AccountRecordId {
++        return self.context.account.id
++    }
++
 +    public func setupReply(toMessageId messageId: EngineMessage.Id) -> Bool {
 +        guard self.chatDisplayNode.historyNode.messageInCurrentHistoryView(messageId) != nil,
 +              let interfaceInteraction = self.interfaceInteraction else {
@@ -929,20 +934,20 @@ index 0000000..6d40491
 +public final class VoiceReplyFragmentStore {
 +    public static let shared = VoiceReplyFragmentStore()
 +
-+    private var pending: (id: EngineMessage.Id, fragment: VoiceReplyFragment, date: Double)?
++    private var pending: (id: EngineMessage.Id, accountId: Int64, fragment: VoiceReplyFragment, date: Double)?
 +
 +    private init() {
 +    }
 +
-+    public func set(_ fragment: VoiceReplyFragment, for id: EngineMessage.Id) {
-+        self.pending = (id, fragment, CFAbsoluteTimeGetCurrent())
++    public func set(_ fragment: VoiceReplyFragment, for id: EngineMessage.Id, accountId: Int64) {
++        self.pending = (id, accountId, fragment, CFAbsoluteTimeGetCurrent())
 +    }
 +
-+    public func take(for id: EngineMessage.Id) -> VoiceReplyFragment? {
++    public func take(for id: EngineMessage.Id, accountId: Int64) -> VoiceReplyFragment? {
 +        guard let pending = self.pending else {
 +            return nil
 +        }
-+        if pending.id != id {
++        if pending.id != id || pending.accountId != accountId {
 +            return nil
 +        }
 +        self.pending = nil

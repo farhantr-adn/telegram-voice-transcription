@@ -5,7 +5,7 @@
 | Check | Evidence / result |
 | --- | --- |
 | Matching Apple toolchain | Xcode 26.6, build 17F113, verified using `xcodebuild -version`. The local build used a canonical Xcode 26.6 installation. |
-| XCTest on matching toolchain | Latest recorded run: **25 tests, zero failures** under Xcode 26.6. These are macOS Foundation tests, not iOS UI tests. |
+| XCTest on matching toolchain | Latest recorded run: **26 tests, zero failures** under Xcode 26.6. These are macOS Foundation tests, not iOS UI tests. |
 | Host source completeness | Sparse checkout expanded; all 13 pinned Git submodules initialized. Git LFS installed and the interrupted wallet dependency checkout repaired. |
 | Portable smoke checks | Current runs passed **480 summary assertions** and **59 alignment checks**. These verify portable logic, not acoustic accuracy or feature UI behavior. |
 | Installer tests | Current run: **18 Node fixture tests passed; 1 real-host audit skipped**. The former 19-pass result including the real host is historical, not current. |

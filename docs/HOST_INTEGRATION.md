@@ -4,7 +4,7 @@ Build and live-smoke evidence is tracked in [BUILD_VALIDATION.md](BUILD_VALIDATI
 
 > **Updated evidence (2026-10-22):** full Debug simulator build passed. One short server transcript + AI Summary, one 1:01 chunked-speech summary and one manual word-seek interaction were observed in the signed-in Premium simulator. These are smoke tests; broad UI coverage, Release/device builds and recipient verification remain open. The separate compile-only startup reached onboarding without login.
 
-> **Current recorded tests:** **25 XCTest cases**, **480 summary smoke assertions**, **59 alignment checks**, and **18 Node fixture passes / 1 skipped real-host audit**. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
+> **Current recorded tests:** **26 XCTest cases**, **480 summary smoke assertions**, **59 alignment checks**, and **18 Node fixture passes / 1 skipped real-host audit**. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
 
 ## Scope and current state (2026-10-22)
 
@@ -124,7 +124,7 @@ Current local evidence recorded on 2026-10-22:
 - **480** summary smoke assertions: [runner](../Scripts/Smoke/main.swift).
 - **59** alignment checks: [runner](../Scripts/AlignmentSmoke/main.swift). Tests lexical agreement and timing rejection, not acoustic accuracy or the asynchronous provider in a host app.
 - **18 Node fixture tests passed; 1 real-host audit skipped**: [suite](../Tests/IntegrationInstaller.test.mjs). Strict installer rejects the generated host lockfile's 139 added lines. Former **19 passes including the real host** are historical.
-- **25 XCTest cases passed with zero failures under Xcode 26.6**. [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
+- **26 XCTest cases passed with zero failures under Xcode 26.6**. [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
 - Full-host **Debug simulator compilation/type-check and linking passed**; the separate compile-only onboarding startup passed. Live smoke evidence also includes one short transcript + summary, one 1:01 chunked-speech summary, and one manual word seek. Release, device and recipient tests remain unverified.
 
 These are limited smoke checks, not comprehensive end-to-end feature tests. Before release, complete Release/device builds and systematically verify both entry points, default/measured/strict provider selection, strict mismatch refusal, speech permissions/locales, playback/seeks, summary API failures and recipient sends. For Quote/Reply, test rich drafts, nonempty selections, edit/removal, normal Send, ordinary reply relationships, recipient rendering, cancellation and draft persistence. Complete localization, accessibility, privacy/security, retention and logging review as detailed in [production readiness](PRODUCTION_READINESS.md).

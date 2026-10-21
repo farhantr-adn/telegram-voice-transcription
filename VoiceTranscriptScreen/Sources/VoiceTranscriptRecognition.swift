@@ -160,7 +160,7 @@ private func transcribeAudioInChunks(path: String, locales: [String], chunks: [V
     }
     return transcribeAudioChunk(path: path, locales: locales, chunk: chunks[index])
     |> mapToSignal { words -> Signal<[LocallyTimedWord]?, NoError> in
-        guard let words, !words.isEmpty else {
+        guard let words else {
             return .single(nil)
         }
         return transcribeAudioInChunks(path: path, locales: locales, chunks: chunks, index: index + 1, accumulated: accumulated + words)

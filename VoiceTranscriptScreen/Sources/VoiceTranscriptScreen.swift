@@ -220,9 +220,14 @@ public final class VoiceTranscriptScreen: ViewController {
                 // The usual case: the chat of the voice message is right under the sheet. Once the sheet is gone the reply is set up
                 // in that chat directly, instead of opening the chat again and scrolling to the message first. Setting it up while
                 // the sheet is still sliding away made the chat's layout and the keyboard compete with the slide, so it waits.
-                let chat = navigationController?.viewControllers.last(where: { ($0 as? ChatController)?.chatLocation.peerId == messageId.peerId }) as? ChatController
+                let chat = navigationController?.viewControllers.last(where: {
+                    guard let chat = $0 as? ChatController else {
+                        return false
+                    }
+                    return chat.accountId == self.context.account.id && chat.chatLocation.peerId == messageId.peerId
+                }) as? ChatController
                 if let fragment {
-                    VoiceReplyFragmentStore.shared.set(fragment, for: messageId)
+                    VoiceReplyFragmentStore.shared.set(fragment, for: messageId, accountId: self.context.account.id.int64)
                 }
                 self.dismiss(completion: { [weak self, weak chat] in
                     if let chat, chat.setupReply(toMessageId: messageId) {
@@ -249,7 +254,7 @@ public final class VoiceTranscriptScreen: ViewController {
             }
             // The chat sets the reply up by message id alone, so a chosen fragment is handed over through the store.
             if let fragment {
-                VoiceReplyFragmentStore.shared.set(fragment, for: messageId)
+                VoiceReplyFragmentStore.shared.set(fragment, for: messageId, accountId: context.account.id.int64)
             }
             context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, context: context, chatLocation: .peer(peer), subject: .message(id: .id(messageId), highlight: ChatControllerSubject.MessageHighlight(quote: nil), timecode: nil, setupReply: true)))
         })
@@ -1225,6 +1230,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         }
         self.messageDuration = nil
         self.didRequestTranscript = false
+        self.didRequestSummary = false
         self.transcriptDisposable.set(nil)
         self.summaryDisposable.set(nil)
         self.summaryView.state = .loading
@@ -3296,7 +3302,6 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
 
     /// Which tasks are ticked. Kept here, so a tick survives the view being laid out again.
     private var taskStates: [Bool] = []
-    private var taskTexts: [String] = []
     /// Whether the whole headline is shown, when it is longer than three lines.
     private var isHeadlineExpanded = false
     private weak var headlineContainer: UIView?
@@ -3308,6 +3313,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
     /// The ticks outlive the sheet: they are saved by the text of the task, and read back when the summary is shown again.
     var loadTaskStates: (() -> [String: Bool])?
     var saveTaskStates: (([String: Bool]) -> Void)?
+    private var taskStateKeys: [String] = []
     /// A tap on a question: the chat is opened with the question quoted in the reply.
     /// A tap on a key point or a question: the view to anchor the menu to (the text of the item), a function that shows the row as active
     /// while its menu is open, the text, and the time of the item.
@@ -3319,8 +3325,10 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
             self.isHeadlineExpanded = false
             if case let .ready(summary) = self.state {
                 let saved = self.loadTaskStates?() ?? [:]
-                self.taskTexts = summary.tasks.map { $0.text }
-                self.taskStates = summary.tasks.map { saved[$0.text] ?? $0.isCompleted }
+                self.taskStateKeys = summary.tasks.map { voiceSummaryTaskStateKey(text: $0.text, time: $0.time) }
+                self.taskStates = summary.tasks.enumerated().map { index, task in
+                    saved[self.taskStateKeys[index]] ?? saved[task.text] ?? task.isCompleted
+                }
             }
             self.rebuild(animated: true)
             self.stateChanged?()
@@ -3869,8 +3877,8 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
                     }
                     self.taskStates[taskIndex] = !self.taskStates[taskIndex]
                     var saved: [String: Bool] = [:]
-                    for (index, text) in self.taskTexts.enumerated() where index < self.taskStates.count {
-                        saved[text] = self.taskStates[index]
+                    for (index, key) in self.taskStateKeys.enumerated() where index < self.taskStates.count {
+                        saved[key] = self.taskStates[index]
                     }
                     self.saveTaskStates?(saved)
                     UIView.transition(with: card, duration: 0.2, options: [.transitionCrossDissolve, .allowUserInteraction], animations: {

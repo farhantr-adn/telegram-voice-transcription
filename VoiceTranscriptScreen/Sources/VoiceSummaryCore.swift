@@ -106,6 +106,13 @@ public struct VoiceSummary: Equatable, Codable {
     }
 }
 
+/// Stable identity for a task row: identical text at different source times
+/// represents separate tasks and must retain separate completion state.
+public func voiceSummaryTaskStateKey(text: String, time: Double?) -> String {
+    let timeKey = time.map { String($0.bitPattern, radix: 16) } ?? "untimed"
+    return "\(timeKey)\u{1f}\(text)"
+}
+
 /// Keep every distinct source time and case-insensitive text pair; joining chunk headlines
 /// needs no additional, potentially truncated AI request.
 public func voiceSummaryCombined(_ summaries: [VoiceSummary]) -> VoiceSummary {

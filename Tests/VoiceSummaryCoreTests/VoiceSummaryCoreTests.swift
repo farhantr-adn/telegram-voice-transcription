@@ -32,6 +32,17 @@ final class VoiceSummaryCoreTests: XCTestCase {
         XCTAssertTrue(voiceAudioRecognitionChunks(duration: 10.0, maximumAudioDuration: 3.0, overlap: 1.5).isEmpty)
     }
 
+    func testTaskStateIdentityIncludesSourceTimeAndPreservesUntimedLegacyTasks() {
+        let first = voiceSummaryTaskStateKey(text: "Call Sam", time: 12.0)
+        let second = voiceSummaryTaskStateKey(text: "Call Sam", time: 24.0)
+        let untimed = voiceSummaryTaskStateKey(text: "Call Sam", time: nil)
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(first, untimed)
+        XCTAssertNotEqual(second, untimed)
+        XCTAssertEqual(first, voiceSummaryTaskStateKey(text: "Call Sam", time: 12.0))
+    }
+
     func testStrictServerParsingNeverSilentlyDropsMalformedItems() {
         XCTAssertNil(parseVoiceSummary("SUMMARY: Plan TASK: 0:99 | invalid", rejectMalformedItems: true))
         XCTAssertNil(parseVoiceSummary("SUMMARY: Plan KEY: 0:12 | valid -1:00 | invalid", rejectMalformedItems: true))
