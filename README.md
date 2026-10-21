@@ -156,6 +156,38 @@ Please read these before trying it.
 | Strict server-word/timing matching provider | [VoiceTranscriptScreen/Sources/VoiceTranscriptAlignment.swift](VoiceTranscriptScreen/Sources/VoiceTranscriptAlignment.swift) |
 | Portable positional lexical matching and timing validation | [VoiceTranscriptScreen/Sources/VoiceTranscriptAlignmentCore.swift](VoiceTranscriptScreen/Sources/VoiceTranscriptAlignmentCore.swift) |
 
+## Implementation architecture
+
+The feature is a Telegram-iOS host module. The sheet consumes a `VoiceTranscriptProvider`; providers own transcript acquisition and summary generation, while the sheet coordinates playback, selection, navigation and presentation. Telegram server transcription is the default. Apple Speech is an explicit optional choice; a Telegram server failure does not silently send the recording to another service.
+
+```mermaid
+flowchart TD
+	Bubble[Voice-message bubble or player header] --> Sheet[VoiceTranscriptScreen]
+	Sheet --> Provider{Selected transcript provider}
+	Provider -->|Default| RPC[Telegram messages.transcribeAudio]
+	RPC --> Attribute[Message transcription attribute updates]
+	Attribute --> ServerText[Transcript text plus estimated timing]
+	Provider -->|User selects speech timing| Download[Download voice media]
+	Download --> Convert[Convert Opus to AAC]
+	Convert --> Plan[Plan overlapping windows under 45 seconds]
+	Plan --> Speech[Sequential Apple Speech recognition]
+	Speech --> Merge[Offset times and keep each window's owned interval]
+	Merge --> MeasuredText[Transcript plus measured timing estimates]
+	ServerText --> TranscriptUI[Transcript rows and synchronized player]
+	MeasuredText --> TranscriptUI
+	TranscriptUI --> Actions[Search, select, copy, translate, quote, seek]
+	Sheet -->|Summary tab opened| Prompt[Timestamped transcript in bounded prompts]
+	Prompt --> AI[Telegram composeAIMessage]
+	AI --> Validate[Strict parse and source-time validation]
+	Validate --> SummaryUI[Key points, tasks, questions and timestamp seeks]
+```
+
+The speech path uses overlapping audio windows so words near a cut retain context. Each recognized word is mapped back to the original recording timeline and included only in the window that owns its midpoint, avoiding overlap duplicates. Requests run sequentially; temporary exports are cleaned up, and failure in any chunk rejects the whole local transcript rather than silently returning partial text. The window planner is covered by portable XCTest. Actual recognition still depends on Apple Speech availability and has not been verified across devices/locales.
+
+AI Summary is requested only when the user opens the Summary tab. Timestamped transcript lines are split losslessly into bounded prompts, sent sequentially to Telegram AI, then strictly parsed and checked against source timestamps. Failed or malformed output makes the summary unavailable; real providers do not substitute sample content. These checks validate structure and allowed timestamps, not factual accuracy.
+
+Search highlighting is visual only. Text selection has a separate word-range model and action menu. **Copy** copies selected text, **Copy Search Query** copies the active query, and **Copy Transcript** copies all transcript text when neither is active. Quote/reply wiring lives in the host patch: it prepares an editable timestamped blockquote in the compose body plus an ordinary reply relationship; recipient behavior still requires separate verification.
+
 `VoiceTranscriptProvider` is the sheet's content interface. `ServerVoiceTranscriptProvider` remains the default; `RecognizedVoiceTranscriptProvider` supplies optional recognition text/times, and `AlignedVoiceTranscriptProvider` supplies optional strictly matched server words with recognition times. Explicit demo providers are not production fallbacks.
 
 ## Changes outside the module
