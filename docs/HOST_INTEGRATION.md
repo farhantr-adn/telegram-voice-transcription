@@ -1,14 +1,14 @@
 # Pinned Telegram-iOS host integration
 
-Latest full-app build and startup evidence is tracked in [BUILD_VALIDATION.md](BUILD_VALIDATION.md). The build uses intentionally invalid API values, not a live-service or production configuration.
+Build and live-smoke evidence is tracked in [BUILD_VALIDATION.md](BUILD_VALIDATION.md). Compile-only builds use intentionally invalid API values; the later transcript/summary smoke used a separately configured signed-in Premium simulator account.
 
-> **Final evidence (2026-10-21): full Debug simulator build passed; startup only verified.** `//Telegram:Telegram` Debug `sim_arm64` compiled/type-checked the feature module and linked the whole app without feature compile fixes. A fresh IPA install reached **Telegram / Start Messaging** onboarding. Release, physical-device and live-feature validation remain open; no login was attempted.
+> **Updated evidence (2026-10-22):** full Debug simulator build passed. One short server transcript + AI Summary, one 1:01 chunked-speech summary and one manual word-seek interaction were observed in the signed-in Premium simulator. These are smoke tests; broad UI coverage, Release/device builds and recipient verification remain open. The separate compile-only startup reached onboarding without login.
 
-> **Current tests:** **23 XCTest cases** (17 summary-core and 6 alignment), **480 summary smoke assertions** and **59 alignment checks** passed under Xcode 26.6. Node: **18 fixture passes / 1 skipped real-host audit**. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
+> **Current recorded tests:** **25 XCTest cases**, **480 summary smoke assertions**, **59 alignment checks**, and **18 Node fixture passes / 1 skipped real-host audit**. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
 
-## Scope and current state (2026-10-21)
+## Scope and current state (2026-10-22)
 
-This feature repository is not a standalone iOS app. The official host is [TelegramMessenger/Telegram-iOS](https://github.com/TelegramMessenger/Telegram-iOS), checked out separately and pinned to **`f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838`**. The full checkout, all 13 pinned submodules and Git LFS content are present. Full Debug simulator compilation and onboarding startup passed. No feature UI test, physical-device test, acoustic accuracy benchmark or live server/recipient verification is claimed.
+This feature repository is not a standalone iOS app. The official host is [TelegramMessenger/Telegram-iOS](https://github.com/TelegramMessenger/Telegram-iOS), checked out separately and pinned to **`f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838`**. The full checkout, all 13 pinned submodules and Git LFS content are present. Full Debug simulator compilation passed, and limited live transcript/summary/seek interactions were manually observed. No feature-specific automated UI suite, physical-device test, broad acoustic accuracy benchmark or recipient verification is claimed.
 
 The historical feature baseline is `abce7ccf9537b4074be346e852e2303c50b649fa` from patsoooo/telegram-voice-transcription. Do not confuse that comparison baseline with the official host pin.
 
@@ -73,7 +73,7 @@ This replaces the historical fragment's local-only behavior. It is **not MTProto
 - **Optional measured recognition:** `RecognizedVoiceTranscriptProvider`, recognizer text and measured estimates, `.measured` provenance; words can differ from the server.
 - **Optional strict matching:** `AlignedVoiceTranscriptProvider`, selected by **Match server words to speech timing (strict)**. Uses [alignVoiceTranscriptWords](../VoiceTranscriptScreen/Sources/VoiceTranscriptAlignmentCore.swift) to transfer recognition timestamps only on complete, exact normalized **positional lexical agreement**. Server word text is preserved. Insertions/deletions, tokenization or lexical mismatches and malformed timing are refused; no skipping, merging, reordering, partial output, guessed alignment or silent estimated fallback. Successful results use `.aligned` provenance.
 
-Strict matching is not arbitrary-speech forced alignment. Lexical agreement does not establish acoustically exact boundaries; measured timestamps have no ground-truth accuracy evaluation here. A universal mathematical guarantee of exact timing cannot be fully implemented or claimed. Recognition permission must already be granted, the device locale is the default (initializer override supported), and on-device-only processing is not guaranteed. Server/strict modes also require an available Telegram server transcript/entitlement.
+Strict matching is not arbitrary-speech forced alignment. A manual transcript-word seek was confirmed to land on the spoken word in the tested sample. That successful sample does not benchmark strict-mode acoustic accuracy across recordings or devices: lexical agreement does not establish exact word boundaries, and measured timestamps have not been compared with ground truth. Recognition permission must already be granted, the device locale is the default (initializer override supported), and on-device-only processing is not guaranteed. Server/strict modes also require an available Telegram server transcript/entitlement.
 
 ## Build prerequisites and compile-only snapshot
 
@@ -118,13 +118,13 @@ Other screenshots are historical interface illustrations. Release/device builds,
 
 ## Verification and release gates
 
-Current local evidence recorded on 2026-10-21:
+Current local evidence recorded on 2026-10-22:
 
 - Foundation summary/alignment package build and Swift module syntax/whitespace checks passed.
 - **480** summary smoke assertions: [runner](../Scripts/Smoke/main.swift).
 - **59** alignment checks: [runner](../Scripts/AlignmentSmoke/main.swift). Tests lexical agreement and timing rejection, not acoustic accuracy or the asynchronous provider in a host app.
 - **18 Node fixture tests passed; 1 real-host audit skipped**: [suite](../Tests/IntegrationInstaller.test.mjs). Strict installer rejects the generated host lockfile's 139 added lines. Former **19 passes including the real host** are historical.
-- **23 XCTest cases passed with zero failures under Xcode 26.6** (17 summary-core, 6 alignment). [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
-- Full-host **Debug simulator compilation/type-check and linking passed**; onboarding startup passed. Release, device, feature UI, live server and recipient tests remain unverified.
+- **25 XCTest cases passed with zero failures under Xcode 26.6**. [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
+- Full-host **Debug simulator compilation/type-check and linking passed**; the separate compile-only onboarding startup passed. Live smoke evidence also includes one short transcript + summary, one 1:01 chunked-speech summary, and one manual word seek. Release, device and recipient tests remain unverified.
 
-These are not end-to-end feature tests. Before release, complete Release/device builds and verify both entry points, default/measured/strict provider selection, strict mismatch refusal, speech permissions/locales, playback/seeks, summary API failures and recipient sends. For Quote/Reply, test rich drafts, nonempty selections, edit/removal, normal Send, ordinary reply relationships, recipient rendering, cancellation and draft persistence. Complete localization, accessibility, privacy/security, retention and logging review as detailed in [production readiness](PRODUCTION_READINESS.md).
+These are limited smoke checks, not comprehensive end-to-end feature tests. Before release, complete Release/device builds and systematically verify both entry points, default/measured/strict provider selection, strict mismatch refusal, speech permissions/locales, playback/seeks, summary API failures and recipient sends. For Quote/Reply, test rich drafts, nonempty selections, edit/removal, normal Send, ordinary reply relationships, recipient rendering, cancellation and draft persistence. Complete localization, accessibility, privacy/security, retention and logging review as detailed in [production readiness](PRODUCTION_READINESS.md).

@@ -1,11 +1,11 @@
-# Full-app validation record — 2026-10-21
+# Full-app validation record — 2026-10-22
 
 ## What has actually been verified
 
 | Check | Evidence / result |
 | --- | --- |
 | Matching Apple toolchain | Xcode 26.6, build 17F113, verified using `xcodebuild -version`. The local build used a canonical Xcode 26.6 installation. |
-| XCTest on matching toolchain | 23 tests executed, zero failures, after moving to the canonical installation. These are macOS Foundation tests, not iOS UI tests. |
+| XCTest on matching toolchain | Latest recorded run: **25 tests, zero failures** under Xcode 26.6. These are macOS Foundation tests, not iOS UI tests. |
 | Host source completeness | Sparse checkout expanded; all 13 pinned Git submodules initialized. Git LFS installed and the interrupted wallet dependency checkout repaired. |
 | Portable smoke checks | Current runs passed **480 summary assertions** and **59 alignment checks**. These verify portable logic, not acoustic accuracy or feature UI behavior. |
 | Installer tests | Current run: **18 Node fixture tests passed; 1 real-host audit skipped**. The former 19-pass result including the real host is historical, not current. |
@@ -13,6 +13,8 @@
 | Incremental repeat | `Target //Telegram:Telegram up-to-date` with `bazel-bin/Telegram/Telegram.ipa`; `Build completed successfully, 1 total action`. |
 | Simulator startup | Fresh IPA installed and bundle `org.local.voicetranscript.CompileOnly` launched on iPhone 17 Pro, iOS 26.5. The app remained alive at the 20-second check; onboarding displayed **Telegram / Start Messaging**. |
 | Host XCUITest `UITests/testLaunch` | **Passed: 1 test, zero failures** on the iPhone 17 Pro / iOS 26.5 runner. The test opened the app and verified foreground state. This is a launch smoke test only. |
+| Live short-message transcript + AI summary | User-confirmed on the signed-in Premium simulator account. One manual transcript word tap/seek also observed. |
+| Long-message chunked speech smoke | User-provided simulator screenshot showed a 1:01 voice message followed by an AI-generated summary after the optional Apple Speech chunk path was added. Manual evidence only; word accuracy and repeatability not measured. |
 | Shader compiler | Apple's Metal Toolchain 17F109 downloaded; `xcrun metal --version` succeeds. |
 | Secure dependency downloads | Bazel initially failed Java certificate validation. A build-local Java truststore combines Bazel's roots and public system-keychain certificates. TLS verification remains enabled; no private keys exported and no global trust changes made. |
 
@@ -26,7 +28,7 @@ The full `//Telegram:Telegram` Debug simulator target **succeeded**, not just th
 4. Xcode under Downloads caused absolute-header validation failures. The generated Apple toolchain's builtin include roots accept user Applications, not Downloads. Xcode was moved to user Applications without disabling include validation.
 5. Old absolute SDK paths remained in compiled artifacts/dependency files. The successful build uses isolated `--output_base=~/Library/Caches/telegram-bazel-xcode266` (expanded by the task), with **no disk-cache option**. Old artifacts were preserved rather than deleted or reused. Canonical Xcode plus **both target and host** `XCODE_VERSION_OVERRIDE` action environments and the new output base fully resolved these path failures; header validation remains enabled.
 
-**Final scope:** full Debug simulator compilation/type-checking, including the feature UI/provider module, and whole-app linking passed. The incremental repeat also succeeded. No feature source compile fixes were needed. This is not a Release/device build or end-to-end feature verification.
+**Build scope:** full Debug simulator compilation/type-checking, including the feature UI/provider module, and whole-app linking passed. The incremental repeat also succeeded. No feature source compile fixes were needed. A limited live transcript/summary interaction is separately recorded above; broad end-to-end coverage and Release/device verification remain open.
 
 ## Installed artifact and startup evidence
 
@@ -147,6 +149,11 @@ Speech assets/network availability. The default Telegram server provider remains
 unchanged and does not silently send audio to Apple's service after a Telegram
 failure.
 
+The transcript Copy menu was later changed to copy selected text first, then the
+active search query, and the entire transcript only when neither applies. The
+latest Debug app was rebuilt and installed with account data preserved. Clipboard
+behavior for the selection/search cases has not yet been manually confirmed.
+
 The user then tapped a transcript word. The shared simulator screenshot shows
 “previously” selected at transcript time `0:04`, while the player position is
 `0:05`; this is a successful manual word-selection/seek/highlight smoke check for
@@ -164,7 +171,8 @@ account data container; this new selection/search copy behavior still needs a
 manual clipboard check.
 
 - Release and physical-device builds/testing; the full Debug simulator build is complete.
-- AI Summary generation and the remaining playback, seek, selection, translation, lifecycle and recipient behavior.
+- Systematic AI Summary validation: failure/timeout/retry behavior, quotas, long-input coverage and factual accuracy. A short live summary and one chunked-speech summary were observed; these do not cover those cases.
+- Remaining playback, seek, selection, copy, translation, lifecycle and recipient behavior beyond the specific manual smoke checks recorded above.
 - A second test account/device for recipient-side send/reply verification; never share passwords, login codes, API hashes or signing secrets in chat.
 - UI-driving automation is not currently exposed to this session through Xcode MCP. Simulator command-line boot/install/launch and screenshots are available, but interactive verification must use a supported automation connection or be performed by the user.
 - The remaining privacy, localization, accessibility and lifecycle gates in [production readiness](PRODUCTION_READINESS.md).
