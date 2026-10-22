@@ -3,6 +3,128 @@ import XCTest
 @testable import VoiceSummaryCore
 
 final class VoiceSummaryCoreTests: XCTestCase {
+    func testTextExportFailsClosedForEveryProtectionReason() {
+        XCTAssertTrue(voiceTranscriptAllowsTextExport(messageExists: true, messageProtected: false, peerProtected: false, myProtected: false, isSecret: false, isViewOnce: false))
+        for index in 0..<6 {
+            var flags = [true, false, false, false, false, false]
+            flags[index].toggle()
+            XCTAssertFalse(voiceTranscriptAllowsTextExport(messageExists: flags[0], messageProtected: flags[1], peerProtected: flags[2], myProtected: flags[3], isSecret: flags[4], isViewOnce: flags[5]))
+        }
+    }
+
+    func testRecognitionOverlapRejectsMissingDifferentAndBoundaryShiftedWords() {
+        let left: [(text: String, start: Double, end: Double)] = [("word", 41.0, 41.5)]
+        XCTAssertTrue(voiceRecognitionOverlapAgrees(left: left, right: left, overlapStart: 40.5, overlapEnd: 43.5, ownershipBoundary: 42))
+        XCTAssertFalse(voiceRecognitionOverlapAgrees(left: left, right: [], overlapStart: 40.5, overlapEnd: 43.5, ownershipBoundary: 42))
+        XCTAssertFalse(voiceRecognitionOverlapAgrees(left: left, right: [("other", 41, 41.5)], overlapStart: 40.5, overlapEnd: 43.5, ownershipBoundary: 42))
+        XCTAssertFalse(voiceRecognitionOverlapAgrees(left: [("word", 41.8, 42)], right: [("word", 42, 42.2)], overlapStart: 40.5, overlapEnd: 43.5, ownershipBoundary: 42))
+        XCTAssertTrue(voiceRecognitionOverlapAgrees(left: [], right: [], overlapStart: 40.5, overlapEnd: 43.5, ownershipBoundary: 42))
+    }
+
+    func testServerRetryIgnoresCachedEmptyAndErrorUntilFreshRead() {
+        for hasError in [false, true] {
+            XCTAssertEqual(voiceServerTranscriptDecision(text: " \n", isPending: false, hasError: hasError, isTooLong: false, didRequest: false, requestInFlight: false), .request)
+            // Unrelated message updates can replay the cached attribute many times.
+            for _ in 0..<3 {
+                XCTAssertEqual(voiceServerTranscriptDecision(text: "", isPending: false, hasError: hasError, isTooLong: false, didRequest: true, requestInFlight: true), .wait)
+            }
+            // Only the committed post-RPC read can classify an identical fresh empty/error.
+            XCTAssertEqual(voiceServerTranscriptDecision(text: "", isPending: false, hasError: hasError, isTooLong: false, didRequest: true, requestInFlight: false), .unavailable)
+        }
+        XCTAssertEqual(voiceServerTranscriptDecision(text: "New words", isPending: false, hasError: false, isTooLong: false, didRequest: true, requestInFlight: true), .wait)
+        XCTAssertEqual(voiceServerTranscriptDecision(text: "New words", isPending: false, hasError: false, isTooLong: false, didRequest: true, requestInFlight: false), .ready("New words"))
+    }
+
+    func testServerRetryWaitsForPendingAndKeepsCachedReadyAndTooLongPolicy() {
+        XCTAssertEqual(voiceServerTranscriptDecision(text: nil, isPending: false, hasError: false, isTooLong: false, didRequest: false, requestInFlight: false), .request)
+        for didRequest in [false, true] {
+            XCTAssertEqual(voiceServerTranscriptDecision(text: "Partial", isPending: true, hasError: false, isTooLong: false, didRequest: didRequest, requestInFlight: false), .wait)
+        }
+        XCTAssertEqual(voiceServerTranscriptDecision(text: " Cached words \n", isPending: false, hasError: false, isTooLong: false, didRequest: false, requestInFlight: false), .ready("Cached words"))
+        XCTAssertEqual(voiceServerTranscriptDecision(text: "", isPending: false, hasError: true, isTooLong: true, didRequest: false, requestInFlight: false), .unavailable)
+    }
+
+    func testStrictParserRejectsEveryEmptyLabelWithoutChangingLenientAPI() {
+        for label in ["SUMMARY", "KEY", "TASK", "QUESTION"] {
+            for empty in ["", "  ", "\n\t"] {
+                let trailing = "SUMMARY: Valid \(label):\(empty)"
+                XCTAssertNil(parseVoiceSummary(trailing, rejectMalformedItems: true), trailing)
+                XCTAssertNotNil(parseVoiceSummary(trailing), trailing)
+                let leading = "\(label):\(empty)\nKEY: 0:12 | Valid"
+                XCTAssertNil(parseVoiceSummary(leading, rejectMalformedItems: true), leading)
+                XCTAssertNotNil(parseVoiceSummary(leading), leading)
+            }
+        }
+        XCTAssertNotNil(parseVoiceSummary("SUMMARY: Valid", rejectMalformedItems: true))
+        XCTAssertNotNil(parseVoiceSummary("KEY: 0:12 | Valid", rejectMalformedItems: true))
+    }
+
+    func testPromptSplitterMovesWholeLineToFreshPrompt() {
+        let header = voiceSummaryInstruction(languageName: nil, maxItems: 3) + "\n\nTranscript:\n"
+        let budget = 900 - header.utf16.count
+        let first = "[0:09] " + String(repeating: "a", count: budget - 25)
+        let second = "[0:10] " + String(repeating: "b", count: 30)
+        let chunks = voiceSummaryPromptChunks(lines: [first, second], sourceTimes: [9.9, 10.9], languageName: nil)
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertEqual(bodies(chunks.map(\.text)), [first + "\n", second])
+        XCTAssertEqual(chunks.map(\.sourceTimes), [[9.9], [10.9]])
+        XCTAssertEqual(voiceSummaryPrompts(lines: [first, second], languageName: nil), chunks.map(\.text))
+    }
+
+    func testPromptTimesFollowContinuationAndMixedSourceLines() throws {
+        let lines = ["[0:10] " + String(repeating: "😀", count: 700), "[2:00] tail"]
+        let chunks = voiceSummaryPromptChunks(lines: lines, sourceTimes: [10.9, 120.25], languageName: nil)
+        XCTAssertGreaterThan(chunks.count, 2)
+        XCTAssertTrue(chunks.allSatisfy { $0.sourceTimes.contains(10.9) })
+        XCTAssertTrue(chunks.dropLast().allSatisfy { $0.sourceTimes == [10.9] })
+        XCTAssertEqual(chunks.last?.sourceTimes, [10.9, 120.25])
+        for chunk in chunks {
+            XCTAssertLessThanOrEqual(chunk.text.utf16.count, 900)
+            let parsed = try XCTUnwrap(parseVoiceSummary("KEY: 0:10 | Continuation", rejectMalformedItems: true))
+            XCTAssertEqual(voiceSummaryValidated(parsed, allowedTimes: chunk.sourceTimes)?.keyPoints.first?.time, 10.9)
+        }
+    }
+
+    func testPromptValidationRejectsOtherChunksTimeForEveryItemKind() throws {
+        let first = "[0:10] " + String(repeating: "a", count: 300)
+        let second = "[2:00] " + String(repeating: "b", count: 300)
+        let chunks = voiceSummaryPromptChunks(lines: [first, second], sourceTimes: [10.9, 120.25], languageName: nil)
+        XCTAssertEqual(chunks.count, 2)
+        let summary = try XCTUnwrap(parseVoiceSummary("KEY: 2:00 | Wrong TASK: 2:00 | Wrong QUESTION: 2:00 | Wrong?", rejectMalformedItems: true))
+        XCTAssertNil(voiceSummaryValidated(summary, allowedTimes: chunks[0].sourceTimes))
+        let valid = try XCTUnwrap(voiceSummaryValidated(summary, allowedTimes: chunks[1].sourceTimes))
+        XCTAssertEqual(valid.keyPoints.map(\.time), [120.25])
+        XCTAssertEqual(valid.tasks.map(\.time), [120.25])
+        XCTAssertEqual(valid.questions.map(\.time), [120.25])
+        let withHeadline = VoiceSummary(headline: "Plausible", keyPoints: summary.keyPoints, tasks: summary.tasks, questions: summary.questions)
+        let filtered = try XCTUnwrap(voiceSummaryValidated(withHeadline, allowedTimes: chunks[0].sourceTimes))
+        XCTAssertTrue(filtered.keyPoints.isEmpty)
+        XCTAssertTrue(filtered.tasks.isEmpty)
+        XCTAssertTrue(filtered.questions.isEmpty)
+    }
+
+    func testPromptMetadataRejectsMismatchedAndInvalidSourceTimes() {
+        XCTAssertTrue(voiceSummaryPromptChunks(lines: ["[0:10] Text"], sourceTimes: [], languageName: nil).isEmpty)
+        for time in [Double.nan, .infinity, -1] {
+            XCTAssertTrue(voiceSummaryPromptChunks(lines: ["[0:10] Text"], sourceTimes: [time], languageName: nil).isEmpty)
+        }
+    }
+
+    func testValidatorPrefersDisplayedFloorSecondBeforeNearestTime() throws {
+        // formatVoiceTranscriptTime uses Int(value.rounded(.down)), not nearest rounding.
+        let parsed = try XCTUnwrap(parseVoiceSummary("KEY: 0:10 | Point TASK: 0:10 | Task QUESTION: 0:10 | Question?", rejectMalformedItems: true))
+        for times in [[9.9, 10.9], [10.9, 9.9]] {
+            let result = try XCTUnwrap(voiceSummaryValidated(parsed, allowedTimes: times))
+            XCTAssertEqual(result.keyPoints.map(\.time), [10.9])
+            XCTAssertEqual(result.tasks.map(\.time), [10.9])
+            XCTAssertEqual(result.questions.map(\.time), [10.9])
+        }
+        let fallback = try XCTUnwrap(voiceSummaryValidated(parsed, allowedTimes: [9.9]))
+        XCTAssertEqual(fallback.keyPoints.first?.time, 9.9, "Keep the legacy +/-1 tolerance when no displayed second matches")
+        let hours = try XCTUnwrap(parseVoiceSummary("KEY: 1:02:03 | Long recording", rejectMalformedItems: true))
+        XCTAssertEqual(voiceSummaryValidated(hours, allowedTimes: [3722.9, 3723.9])?.keyPoints.first?.time, 3723.9)
+    }
+
     func testLongAudioRecognitionChunksStayBoundedAndCoverTimelineExactly() {
         let chunks = voiceAudioRecognitionChunks(duration: 126.0)
 

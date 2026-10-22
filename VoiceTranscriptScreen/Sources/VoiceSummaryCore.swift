@@ -1,5 +1,46 @@
 import Foundation
 
+/// Source policy is fail-closed: no transcript processing or text export before
+/// a source message is available, or for protected, secret or view-once sources.
+public func voiceTranscriptAllowsTextExport(messageExists: Bool, messageProtected: Bool, peerProtected: Bool, myProtected: Bool, isSecret: Bool, isViewOnce: Bool) -> Bool {
+    return messageExists && !messageProtected && !peerProtected && !myProtected && !isSecret && !isViewOnce
+}
+
+/// Adjacent Speech requests must agree on their shared context before we splice
+/// their owned words. Disagreement is unavailable, never silent partial success.
+public func voiceRecognitionOverlapAgrees(left: [(text: String, start: Double, end: Double)], right: [(text: String, start: Double, end: Double)], overlapStart: Double, overlapEnd: Double, ownershipBoundary: Double) -> Bool {
+    let context: ([(text: String, start: Double, end: Double)]) -> [(text: String, start: Double, end: Double)] = { values in
+        values.filter {
+            let midpoint = ($0.start + $0.end) * 0.5
+            return midpoint >= overlapStart && midpoint < overlapEnd
+        }
+    }
+    let lhs = context(left)
+    let rhs = context(right)
+    guard lhs.count == rhs.count else { return false }
+    return zip(lhs, rhs).allSatisfy { first, second in
+        first.text.trimmingCharacters(in: .whitespacesAndNewlines) == second.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            && abs(first.start - second.start) <= 0.25 && abs(first.end - second.end) <= 0.25
+            && ((first.start + first.end) * 0.5 < ownershipBoundary) == ((second.start + second.end) * 0.5 < ownershipBoundary)
+    }
+}
+
+/// Unusable cached attributes are not results of the explicit retry. The caller
+/// re-reads the committed message after RPC success before clearing `requestInFlight`.
+enum VoiceServerTranscriptDecision: Equatable {
+    case wait, request, unavailable
+    case ready(String)
+}
+
+func voiceServerTranscriptDecision(text: String?, isPending: Bool, hasError: Bool, isTooLong: Bool, didRequest: Bool, requestInFlight: Bool) -> VoiceServerTranscriptDecision {
+    if requestInFlight { return .wait }
+    if isTooLong { return .unavailable }
+    if isPending { return .wait }
+    let text = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !hasError && !text.isEmpty { return .ready(text) }
+    return didRequest ? .unavailable : .request
+}
+
 /// One bounded speech-recognition window plus the non-overlapping time interval
 /// whose words this window owns. Small overlaps give the recognizer context at
 /// cut points without duplicating words in the assembled transcript.
@@ -150,21 +191,39 @@ public func voiceSummaryInstruction(languageName: String?, maxItems: Int) -> Str
 /// Every prompt is at most 900 UTF-16 units, including its instruction. No sampling.
 /// Streaming scalar iteration bounds temporary storage even for a single enormous grapheme.
 /// Continuation chunks repeat the original line's timestamp, but never discard source scalars.
+public struct VoiceSummaryPrompt: Equatable {
+    public let text: String
+    public let sourceTimes: [Double]
+}
+
+/// Compatibility API for callers that only need the prompt text.
 public func voiceSummaryPrompts(lines: [String], languageName: String?) -> [String] {
+    return voiceSummaryPromptChunks(lines: lines, sourceTimes: lines.map { _ in 0 }, languageName: languageName).map(\.text)
+}
+
+/// Carry exact source times alongside each prompt, including repeated continuation prefixes.
+public func voiceSummaryPromptChunks(lines: [String], sourceTimes: [Double], languageName: String?) -> [VoiceSummaryPrompt] {
+    guard lines.count == sourceTimes.count, sourceTimes.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return [] }
     // Refuse a pathological language name without building a large instruction first.
     if let languageName, languageName.utf16.prefix(901).count > 900 { return [] }
     let header = voiceSummaryInstruction(languageName: languageName, maxItems: 3) + "\n\nTranscript:\n"
     let budget = 900 - header.utf16.count
     guard budget >= 2, !lines.isEmpty else { return [] }
-    var result: [String] = []
+    var result: [VoiceSummaryPrompt] = []
     var current = ""
     var units = 0
+    var currentTimes: [Double] = []
+
+    func includeTime(_ time: Double) {
+        if !currentTimes.contains(time) { currentTimes.append(time) }
+    }
 
     func flush() -> Bool {
         guard result.count < 128 else { return false }
-        result.append(header + current)
+        result.append(VoiceSummaryPrompt(text: header + current, sourceTimes: currentTimes))
         current = ""
         units = 0
+        currentTimes = []
         return true
     }
 
@@ -188,6 +247,12 @@ public func voiceSummaryPrompts(lines: [String], languageName: String?) -> [Stri
             current.append("\n")
             units += 1
         }
+        // Prefer a complete line on a fresh prompt over an unnecessary continuation.
+        // Bounded scanning retains the huge-word memory guarantee.
+        let lineUnits = line.utf16.prefix(budget + 1).count
+        if !current.isEmpty && lineUnits <= budget && units + lineUnits > budget {
+            guard flush(), result.count < 128 else { return [] }
+        }
         // Do not split a new line's timestamp itself across prompt boundaries.
         if !current.isEmpty && units + continuationUnits > budget {
             guard flush(), result.count < 128 else { return [] }
@@ -201,6 +266,7 @@ public func voiceSummaryPrompts(lines: [String], languageName: String?) -> [Stri
             }
             current.unicodeScalars.append(scalar)
             units += width
+            includeTime(sourceTimes[lineIndex])
         }
     }
     if !current.isEmpty || result.isEmpty {
@@ -263,7 +329,7 @@ public func parseVoiceSummary(_ text: String, rejectMalformedItems: Bool = false
     let cleaned = text.replacingOccurrences(of: "**", with: "")
     let string = cleaned as NSString
     let regex = try! NSRegularExpression(
-        pattern: "(?:^|\\s)(?:[-*•–—]+\\s*|[0-9]+[.)]\\s*)?(SUMMARY|KEY|TASK|QUESTION):\\s*",
+        pattern: "(?:^|\\s)(?:[-*•–—]+\\s*|[0-9]+[.)]\\s*)?(SUMMARY|KEY|TASK|QUESTION):",
         options: [.caseInsensitive]
     )
     let matches = regex.matches(in: cleaned, range: NSRange(location: 0, length: string.length))
@@ -276,7 +342,10 @@ public func parseVoiceSummary(_ text: String, rejectMalformedItems: Bool = false
         let end = index + 1 < matches.count ? matches[index + 1].range.location : string.length
         let value = string.substring(with: NSRange(location: start, length: end - start))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { continue }
+        guard !value.isEmpty else {
+            if rejectMalformedItems { return nil }
+            continue
+        }
         switch string.substring(with: match.range(at: 1)).uppercased() {
         case "SUMMARY": headline = value
         case "KEY", "QUESTION":
@@ -303,13 +372,18 @@ public func parseVoiceSummary(_ text: String, rejectMalformedItems: Bool = false
     return VoiceSummary(headline: headline, keyPoints: points, tasks: tasks, questions: questions)
 }
 
-/// A rounded model timestamp may differ by at most one second; always return the
-/// nearest actual source time, not the model's value. Untimed legacy tasks stay untimed.
+/// Prefer the source whose floor second matches `formatVoiceTranscriptTime`'s
+/// displayed timestamp, then tolerate rounding by at most one second. Always
+/// return an actual source time. Untimed legacy tasks stay untimed.
 public func voiceSummaryValidated(_ summary: VoiceSummary, allowedTimes: [Double]) -> VoiceSummary? {
     guard !summary.isPlaceholder else { return nil }
     let times = allowedTimes.filter { $0.isFinite && $0 >= 0 }
     func sourceTime(_ value: Double) -> Double? {
         guard value.isFinite, value >= 0 else { return nil }
+        let displayedMatches = times.filter { $0.rounded(.down) == value }
+        if let matching = displayedMatches.min(by: { abs($0 - value) < abs($1 - value) }) {
+            return matching
+        }
         guard let nearest = times.min(by: { abs($0 - value) < abs($1 - value) }),
               abs(nearest - value) <= 1 else { return nil }
         return nearest

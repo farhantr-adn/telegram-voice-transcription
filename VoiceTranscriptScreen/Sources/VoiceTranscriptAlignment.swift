@@ -24,7 +24,7 @@ public final class AlignedVoiceTranscriptProvider: VoiceTranscriptProvider {
 
     // Filter loading BEFORE the deadline, so repeated loading cannot reset the budget. Empty
     // completion and a provider that never completes both produce exactly one terminal state.
-    private func terminal(_ signal: Signal<VoiceTranscriptState, NoError>) -> Signal<VoiceTranscriptState, NoError> {
+    private func terminal(_ signal: Signal<VoiceTranscriptState, NoError>, deadline: Double) -> Signal<VoiceTranscriptState, NoError> {
         return signal
         |> filter { state in
             switch state {
@@ -34,7 +34,7 @@ public final class AlignedVoiceTranscriptProvider: VoiceTranscriptProvider {
         }
         |> then(Signal<VoiceTranscriptState, NoError>.single(.unavailable))
         |> take(1)
-        |> timeout(90.0, queue: Queue.mainQueue(), alternate: .single(.unavailable))
+        |> timeout(deadline, queue: Queue.mainQueue(), alternate: .single(.unavailable))
     }
 
     private func words(_ transcript: VoiceTranscript) -> [VoiceTranscriptWord]? {
@@ -52,13 +52,13 @@ public final class AlignedVoiceTranscriptProvider: VoiceTranscriptProvider {
         guard duration.isFinite, duration > 0 else {
             return .single(.loading) |> then(.single(.unavailable))
         }
-        let aligned = self.terminal(self.server.transcript(context: context, messageId: messageId, duration: duration))
+        let aligned = self.terminal(self.server.transcript(context: context, messageId: messageId, duration: duration), deadline: 90.0)
         |> mapToSignal { state -> Signal<VoiceTranscriptState, NoError> in
             guard case let .ready(serverTranscript) = state,
                   serverTranscript.timingProvenance == .estimated,
                   let serverWords = self.words(serverTranscript) else { return .single(.unavailable) }
             // Recognition is requested only after a usable server result, with its own deadline.
-            return self.terminal(self.speech.transcript(context: context, messageId: messageId, duration: duration))
+            return self.terminal(self.speech.transcript(context: context, messageId: messageId, duration: duration), deadline: voiceTranscriptSpeechDeadline(duration: duration))
             |> map { state -> VoiceTranscriptState in
                 guard case let .ready(recognized) = state,
                       recognized.timingProvenance == .measured,

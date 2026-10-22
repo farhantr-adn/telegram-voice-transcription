@@ -76,60 +76,50 @@ public final class ServerVoiceTranscriptProvider: VoiceTranscriptProvider {
             }
             
             let requestDisposable = MetaDisposable()
+            let refreshDisposable = MetaDisposable()
             var didRequest = false
-            let messageDisposable = (context.engine.data.subscribe(TelegramEngine.EngineData.Item.Messages.Message(id: messageId))
-            |> deliverOnMainQueue).start(next: { message in
+            var requestInFlight = false
+            let consumeMessage: (EngineMessage?) -> Bool = { message in
+                guard !isFinished else { return false }
                 guard let message else {
                     #if DEBUG
                     voiceTranscriptDebugReason = "Telegram message lookup returned no message"
                     #endif
                     finish(.unavailable)
-                    return
+                    return false
                 }
                 let attribute = message._asMessage().attributes.first(where: { $0 is AudioTranscriptionMessageAttribute }) as? AudioTranscriptionMessageAttribute
-                if let attribute {
-                    if attribute.error == .tooLong {
-                        #if DEBUG
-                        voiceTranscriptDebugReason = "Telegram reports this voice message is too long to transcribe"
-                        #endif
-                        finish(.unavailable)
-                        return
-                    }
-                    if attribute.isPending {
-                        // Still being made: the final text arrives as an update of this same attribute.
-                        return
-                    }
-                    if attribute.error == nil {
-                        let text = attribute.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if text.isEmpty {
-                            #if DEBUG
-                            voiceTranscriptDebugReason = didRequest
-                                ? "Telegram returned an empty transcript after retry"
-                                : "Retrying Telegram because this message has a cached empty transcript"
-                            #endif
-                            if didRequest {
-                                finish(.unavailable)
-                                return
-                            }
-                            // The stored empty result may be stale (e.g. a previous pending or
-                            // transient server response). Fall through to one fresh RPC below.
-                        } else {
-                            finish(.ready(approximateVoiceTranscript(text: text, duration: duration)))
-                            return
-                        }
-                    }
-                    // A previous generic server rejection may be transient. Fall through
-                    // and retry it once for this explicit transcript-sheet request.
+                switch voiceServerTranscriptDecision(
+                    text: attribute?.text, isPending: attribute?.isPending ?? false,
+                    hasError: attribute?.error != nil, isTooLong: attribute?.error == .tooLong,
+                    didRequest: didRequest, requestInFlight: requestInFlight
+                ) {
+                case .wait:
+                    return false
+                case let .ready(text):
+                    finish(.ready(approximateVoiceTranscript(text: text, duration: duration)))
+                    return false
+                case .unavailable:
                     #if DEBUG
-                    voiceTranscriptDebugReason = "Retrying Telegram after a previous generic transcription rejection"
+                    voiceTranscriptDebugReason = attribute?.error == .tooLong
+                        ? "Telegram reports this voice message is too long to transcribe"
+                        : "Telegram returned no usable transcript after retry"
                     #endif
+                    finish(.unavailable)
+                    return false
+                case .request:
+                    return true
                 }
-                
+            }
+            let messageDisposable = (context.engine.data.subscribe(TelegramEngine.EngineData.Item.Messages.Message(id: messageId))
+            |> deliverOnMainQueue).start(next: { message in
+                guard consumeMessage(message) else { return }
                 if !didRequest {
                     didRequest = true
+                    requestInFlight = true
                     requestDisposable.set((context.engine.messages.transcribeAudio(messageId: messageId)
                     |> deliverOnMainQueue).start(next: { result in
-                        // On success the text arrives through the message above.
+                        guard !isFinished else { return }
                         if case let .error(code) = result {
                             #if DEBUG
                             voiceTranscriptDebugReason = "Telegram rejected transcription (RPC: \(code))"
@@ -139,6 +129,15 @@ public final class ServerVoiceTranscriptProvider: VoiceTranscriptProvider {
                             #if DEBUG
                             voiceTranscriptDebugReason = "Telegram accepted the request; waiting for its transcript update"
                             #endif
+                            // The RPC emits success after committing its attribute. Re-read it:
+                            // queued subscription events can still contain the cached empty/error,
+                            // and an identical fresh empty result need not emit a changed view.
+                            refreshDisposable.set((context.engine.data.get(TelegramEngine.EngineData.Item.Messages.Message(id: messageId))
+                            |> deliverOnMainQueue).start(next: { refreshedMessage in
+                                guard !isFinished else { return }
+                                requestInFlight = false
+                                _ = consumeMessage(refreshedMessage)
+                            }))
                         }
                     }))
                 }
@@ -156,6 +155,7 @@ public final class ServerVoiceTranscriptProvider: VoiceTranscriptProvider {
             return ActionDisposable {
                 messageDisposable.dispose()
                 requestDisposable.dispose()
+                refreshDisposable.dispose()
                 timer.invalidate()
             }
         }
@@ -311,23 +311,21 @@ extension ServerVoiceTranscriptProvider {
         voiceSummaryDebugReason = nil
         #endif
         let languageName = voiceSummaryLanguageName(of: lines.joined(separator: " "))
-        let prompts = voiceSummaryPrompts(lines: lines, languageName: languageName)
+        let prompts = voiceSummaryPromptChunks(lines: lines, sourceTimes: segments.map { $0.start }, languageName: languageName)
         guard !prompts.isEmpty else {
             // The portable chunker refuses oversize input rather than dropping any of it.
             return .single(.unavailable)
         }
-        let allowedTimes = segments.map { $0.start }
-
         // Subscribe to the next part only after the current part succeeds. No parallel fanout,
         // rewrite fallback, or partially successful result; each part has its own bounded retry budget.
         func accumulate(_ index: Int, summaries: [VoiceSummary]) -> Signal<VoiceSummaryState, NoError> {
             if index == prompts.count {
                 return .single(.ready(voiceSummaryCombined(summaries)))
             }
-            return voiceSummaryGenerate(context: context, prompt: prompts[index])
+            return voiceSummaryGenerate(context: context, prompt: prompts[index].text)
             |> mapToSignal { text -> Signal<VoiceSummaryState, NoError> in
                 guard let text, let parsed = parseVoiceSummary(text, rejectMalformedItems: true),
-                      let validated = voiceSummaryValidated(parsed, allowedTimes: allowedTimes),
+                      let validated = voiceSummaryValidated(parsed, allowedTimes: prompts[index].sourceTimes),
                       validated.keyPoints.count == parsed.keyPoints.count,
                       validated.questions.count == parsed.questions.count,
                       validated.tasks.count == parsed.tasks.count else {

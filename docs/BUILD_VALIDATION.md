@@ -1,16 +1,39 @@
 # Full-app validation record — 2026-10-22
 
+## Follow-up review fixes — 2026-10-22
+
+The actual current XCTest suite passed **36 tests with zero failures**. The core validation task passed with **526 summary smoke assertions, 59 alignment checks, 18 installer fixture passes and 1 skipped real-host audit**. The final full host Debug simulator build **passed after all source changes: 77.927 seconds, 24 actions**. User-provided live simulator evidence below refers to earlier builds. Protection and cleanup evidence is limited to code tests/static checks and the full build; no signed-in runtime testing was performed after these changes, and no new permission, cleanup or content-protection end-to-end validation is claimed.
+
+Two high findings were addressed:
+
+- **Temporary audio copies:** cleanup covers success, error and cancellation, including cancellation while Speech authorization is pending. The converted temporary file is retained while conversion is active; cancellation drains the writer before cleanup. If the converter never terminates, cleanup cannot safely complete; unconditional deletion is not guaranteed.
+- **Content protection:** transcript acquisition, export and AI processing fail closed on message- and peer-level protection, including unavailable protection state. Host quote insertion rechecks protection in both synchronous and asynchronous paths.
+
+Eight additional missed findings were implemented:
+
+1. A retry waits past the stale cached server error rather than immediately treating it as the retry result.
+2. AI timestamps are validated against the source times of that individual prompt, not the entire transcript.
+3. Whole source lines start new prompts when they fit there; only oversized lines need splitting.
+4. Strict parsing rejects empty labeled items.
+5. Display timestamps floor total seconds before splitting into minutes and seconds.
+6. Strict speech timing uses a chunk-scaled **90–900-second** budget; the server transcript wait has its own separate **90-second** budget.
+7. All chunk word timing is validated before ownership filtering, including words that would be discarded.
+8. Overlapping contexts require lexical, timing and ownership agreement; disagreements reject the transcript rather than silently choosing a chunk.
+
+These fixes do not close the known privacy gate: task text remains stored in UserDefaults. Live permission/cleanup/protection end-to-end checks and the remaining release gates below are still open.
+
 ## What has actually been verified
 
 | Check | Evidence / result |
 | --- | --- |
 | Matching Apple toolchain | Xcode 26.6, build 17F113, verified using `xcodebuild -version`. The local build used a canonical Xcode 26.6 installation. |
-| XCTest on matching toolchain | Latest recorded run: **26 tests, zero failures** under Xcode 26.6. These are macOS Foundation tests, not iOS UI tests. |
+| XCTest on matching toolchain | Latest recorded run: **36 tests, zero failures** under Xcode 26.6. These are macOS Foundation tests, not iOS UI tests. |
 | Host source completeness | Sparse checkout expanded; all 13 pinned Git submodules initialized. Git LFS installed and the interrupted wallet dependency checkout repaired. |
-| Portable smoke checks | Current runs passed **480 summary assertions** and **59 alignment checks**. These verify portable logic, not acoustic accuracy or feature UI behavior. |
+| Portable smoke checks | Current runs passed **526 summary assertions** and **59 alignment checks**. The assertion count grew with improved splitting coverage. These verify portable logic, not acoustic accuracy or feature UI behavior. |
 | Installer tests | Current run: **18 Node fixture tests passed; 1 real-host audit skipped**. The former 19-pass result including the real host is historical, not current. |
-| Full Debug simulator build | **Passed:** `//Telegram:Telegram`, Debug `sim_arm64`. The feature UI module emitted and the whole app linked; no feature compile fixes were needed. |
-| Incremental repeat | `Target //Telegram:Telegram up-to-date` with `bazel-bin/Telegram/Telegram.ipa`; `Build completed successfully, 1 total action`. |
+| Initial full Debug simulator build | **Passed before the follow-up fixes:** `//Telegram:Telegram`, Debug `sim_arm64`. The feature UI module emitted and the whole app linked; no feature compile fixes were needed. |
+| Final full host Debug simulator build | **Passed after all source changes, including the final review fixes:** `//Telegram:Telegram`, Debug `sim_arm64`; **77.927 seconds, 24 actions**. This verifies compilation/linking, not a new signed-in runtime test. |
+| Earlier incremental repeat | `Target //Telegram:Telegram up-to-date` with `bazel-bin/Telegram/Telegram.ipa`; `Build completed successfully, 1 total action`. |
 | Simulator startup | Fresh IPA installed and bundle `org.local.voicetranscript.CompileOnly` launched on iPhone 17 Pro, iOS 26.5. The app remained alive at the 20-second check; onboarding displayed **Telegram / Start Messaging**. |
 | Host XCUITest `UITests/testLaunch` | **Passed: 1 test, zero failures** on the iPhone 17 Pro / iOS 26.5 runner. The test opened the app and verified foreground state. This is a launch smoke test only. |
 | Live short-message transcript + AI summary | User-confirmed on the signed-in Premium simulator account. One manual transcript word tap/seek also observed. |
@@ -20,7 +43,7 @@
 
 ## Full build result and resolved setup failures
 
-The full `//Telegram:Telegram` Debug simulator target **succeeded**, not just the feature module. Early attempts failed on environment setup:
+The final full `//Telegram:Telegram` Debug simulator target **succeeded after all source changes (77.927 seconds, 24 actions)**, including the follow-up fixes above. The initial full build had also succeeded before those fixes. Early attempts failed on environment setup:
 
 1. Bazel registry TLS trust-chain failure. Resolved with a local Java truststore rather than disabling certificate verification.
 2. Missing Metal compiler. Downloaded Apple's Metal component.
@@ -28,7 +51,7 @@ The full `//Telegram:Telegram` Debug simulator target **succeeded**, not just th
 4. Xcode under Downloads caused absolute-header validation failures. The generated Apple toolchain's builtin include roots accept user Applications, not Downloads. Xcode was moved to user Applications without disabling include validation.
 5. Old absolute SDK paths remained in compiled artifacts/dependency files. The successful build uses isolated `--output_base=~/Library/Caches/telegram-bazel-xcode266` (expanded by the task), with **no disk-cache option**. Old artifacts were preserved rather than deleted or reused. Canonical Xcode plus **both target and host** `XCODE_VERSION_OVERRIDE` action environments and the new output base fully resolved these path failures; header validation remains enabled.
 
-**Build scope:** full Debug simulator compilation/type-checking, including the feature UI/provider module, and whole-app linking passed. The incremental repeat also succeeded. No feature source compile fixes were needed. A limited live transcript/summary interaction is separately recorded above; broad end-to-end coverage and Release/device verification remain open.
+**Verified build scope:** final full Debug simulator compilation/type-checking, including the feature UI/provider module, and whole-app linking passed after all source changes. The earlier initial build and incremental repeat also succeeded without feature source compile fixes. Limited live transcript/summary interactions from earlier builds are separately recorded above; no signed-in runtime test followed the final changes. Broad end-to-end coverage and Release/device verification remain open.
 
 ## Installed artifact and startup evidence
 
@@ -170,7 +193,8 @@ active. The Debug simulator rebuild passed and was installed while preserving th
 account data container; this new selection/search copy behavior still needs a
 manual clipboard check.
 
-- Release and physical-device builds/testing; the full Debug simulator build is complete.
+- Release and physical-device builds/testing; the final-change full Debug simulator build passed (77.927 seconds, 24 actions).
+- Live permission, cleanup and protection end-to-end checks after the final changes; current evidence for protection and cleanup is code tests/static checks plus the full build only.
 - Systematic AI Summary validation: failure/timeout/retry behavior, quotas, long-input coverage and factual accuracy. A short live summary and one chunked-speech summary were observed; these do not cover those cases.
 - Remaining playback, seek, selection, copy, translation, lifecycle and recipient behavior beyond the specific manual smoke checks recorded above.
 - A second test account/device for recipient-side send/reply verification; never share passwords, login codes, API hashes or signing secrets in chat.

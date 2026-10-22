@@ -2,13 +2,13 @@
 
 Build and live-smoke evidence is tracked in [BUILD_VALIDATION.md](BUILD_VALIDATION.md). Compile-only builds use intentionally invalid API values; the later transcript/summary smoke used a separately configured signed-in Premium simulator account.
 
-> **Updated evidence (2026-10-22):** full Debug simulator build passed. One short server transcript + AI Summary, one 1:01 chunked-speech summary and one manual word-seek interaction were observed in the signed-in Premium simulator. These are smoke tests; broad UI coverage, Release/device builds and recipient verification remain open. The separate compile-only startup reached onboarding without login.
+> **Updated evidence (2026-10-22):** the final full host Debug simulator build **passed after all source changes: 77.927 seconds, 24 actions**. One short server transcript + AI Summary, one 1:01 chunked-speech summary and one manual word-seek interaction were observed in earlier builds on the signed-in Premium simulator. Protection and cleanup evidence is limited to code tests/static checks and the full build; no signed-in runtime testing followed the final changes, and no new live permission, cleanup or protection end-to-end validation is claimed. See the [follow-up review fixes](BUILD_VALIDATION.md#follow-up-review-fixes--2026-10-22). The separate compile-only startup reached onboarding without login.
 
-> **Current recorded tests:** **26 XCTest cases**, **480 summary smoke assertions**, **59 alignment checks**, and **18 Node fixture passes / 1 skipped real-host audit**. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
+> **Current recorded tests:** **36 XCTest cases passed with zero failures**, **526 summary smoke assertions**, **59 alignment checks**, and **18 Node fixture passes / 1 skipped real-host audit**. The core validation task passed. The former 19-pass result including the real host is historical; the generated host lockfile currently blocks the strict audit.
 
 ## Scope and current state (2026-10-22)
 
-This feature repository is not a standalone iOS app. The official host is [TelegramMessenger/Telegram-iOS](https://github.com/TelegramMessenger/Telegram-iOS), checked out separately and pinned to **`f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838`**. The full checkout, all 13 pinned submodules and Git LFS content are present. Full Debug simulator compilation passed, and limited live transcript/summary/seek interactions were manually observed. No feature-specific automated UI suite, physical-device test, broad acoustic accuracy benchmark or recipient verification is claimed.
+This feature repository is not a standalone iOS app. The official host is [TelegramMessenger/Telegram-iOS](https://github.com/TelegramMessenger/Telegram-iOS), checked out separately and pinned to **`f1dd7a2dbd02cbbf513e75d5695d8d36d1cf5838`**. The full checkout, all 13 pinned submodules and Git LFS content are present. Final full Debug simulator compilation passed after all source changes, and limited live transcript/summary/seek interactions were manually observed in earlier builds. No feature-specific automated UI suite, physical-device test, broad acoustic accuracy benchmark or recipient verification is claimed.
 
 The historical feature baseline is `abce7ccf9537b4074be346e852e2303c50b649fa` from patsoooo/telegram-voice-transcription. Do not confuse that comparison baseline with the official host pin.
 
@@ -67,6 +67,12 @@ The combined patch uses the normal native reply relationship to the voice messag
 
 This replaces the historical fragment's local-only behavior. It is **not MTProto `quote_text`**, a server-verified transcript quote, or a guaranteed clickable audio time. Server transcript text is not the audio message's `message.text`, so treating it as a quoted substring of that field would be incorrect. Recipient visibility is implemented via ordinary message-body content, **not yet verified by sending to a recipient**. Separately, Share still sends timestamped plain text through confirmation UI.
 
+### Protection and temporary-audio lifecycle
+
+Message- and peer-level content protection is checked fail closed for transcript acquisition, export and AI processing, including unavailable protection state. Host quote insertion rechecks protection both synchronously and after asynchronous work. Verify these paths, including protection changes while the sheet or quote flow is open, before release.
+
+Temporary audio copies have success/error/cancellation cleanup, including cancellation while Speech authorization is pending. The converted temporary file is retained until its writer drains on cancellation; if the converter never terminates, cleanup cannot safely complete. Task text retained in UserDefaults remains a known privacy gate. The [dated review record](BUILD_VALIDATION.md#follow-up-review-fixes--2026-10-22) details the eight additional retry, prompt, parsing, timing and overlap fixes.
+
 ### Timing providers
 
 - **Default:** `ServerVoiceTranscriptProvider`, server text with estimated timing, `.estimated` provenance.
@@ -108,7 +114,7 @@ Follow the [official compilation guide at the pinned commit](https://github.com/
 
 The [feature build task](../.vscode/tasks.json) invokes the already-configured host with the **pre-resolved** compile-only configuration, isolated output base and build-local truststore. It does not bootstrap a fresh checkout or resolve configuration itself. The tracked [simulator example](../Integration/simulator-compile-only.example.json) contains dummy zero API values that deliberately **cannot log in**. Keep real credentials only in the ignored `Integration/local-development.json` file.
 
-**Build result:** full Debug `sim_arm64` succeeded, including feature UI module emission and whole-app linking, without feature compile fixes. The incremental repeat reported `Target //Telegram:Telegram up-to-date`, `bazel-bin/Telegram/Telegram.ipa`, and `Build completed successfully, 1 total action`.
+**Final build result:** the full host Debug `sim_arm64` build **passed after all source changes, including the final fixes (77.927 seconds, 24 actions)**. The initial full build had already succeeded, including feature UI module emission and whole-app linking, without feature compile fixes. The earlier incremental repeat reported `Target //Telegram:Telegram up-to-date`, `bazel-bin/Telegram/Telegram.ipa`, and `Build completed successfully, 1 total action`. The final build is compile/link evidence only, not a new signed-in runtime check.
 
 **Startup result:** the fresh IPA was unzipped into a temporary directory under the user cache and installed on the simulator above. Bundle `org.local.voicetranscript.CompileOnly` launched, remained alive at 20 seconds, and displayed onboarding. No login was attempted in this compile-only startup check; this does not verify transcript, summary, playback, sends or recipient behavior.
 
@@ -121,10 +127,10 @@ Other screenshots are historical interface illustrations. Release/device builds,
 Current local evidence recorded on 2026-10-22:
 
 - Foundation summary/alignment package build and Swift module syntax/whitespace checks passed.
-- **480** summary smoke assertions: [runner](../Scripts/Smoke/main.swift).
+- **526** summary smoke assertions: [runner](../Scripts/Smoke/main.swift).
 - **59** alignment checks: [runner](../Scripts/AlignmentSmoke/main.swift). Tests lexical agreement and timing rejection, not acoustic accuracy or the asynchronous provider in a host app.
 - **18 Node fixture tests passed; 1 real-host audit skipped**: [suite](../Tests/IntegrationInstaller.test.mjs). Strict installer rejects the generated host lockfile's 139 added lines. Former **19 passes including the real host** are historical.
-- **26 XCTest cases passed with zero failures under Xcode 26.6**. [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
-- Full-host **Debug simulator compilation/type-check and linking passed**; the separate compile-only onboarding startup passed. Live smoke evidence also includes one short transcript + summary, one 1:01 chunked-speech summary, and one manual word seek. Release, device and recipient tests remain unverified.
+- **36 XCTest cases passed with zero failures under Xcode 26.6**. [CI](../.github/workflows/swift-core.yml) is configured, not claimed run. The feature validation task includes both smoke runners and Node tests, not XCTest.
+- Final full-host **Debug simulator compilation/type-check and linking passed after all source changes (77.927 seconds, 24 actions)**; the separate earlier compile-only onboarding startup passed. Earlier live smoke evidence also includes one short transcript + summary, one 1:01 chunked-speech summary, and one manual word seek. No signed-in runtime testing followed the final changes; protection and cleanup have code-test/static-check and full-build evidence only. Release, device and recipient tests remain unverified.
 
 These are limited smoke checks, not comprehensive end-to-end feature tests. Before release, complete Release/device builds and systematically verify both entry points, default/measured/strict provider selection, strict mismatch refusal, speech permissions/locales, playback/seeks, summary API failures and recipient sends. For Quote/Reply, test rich drafts, nonempty selections, edit/removal, normal Send, ordinary reply relationships, recipient rendering, cancellation and draft persistence. Complete localization, accessibility, privacy/security, retention and logging review as detailed in [production readiness](PRODUCTION_READINESS.md).

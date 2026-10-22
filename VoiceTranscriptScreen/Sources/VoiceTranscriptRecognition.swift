@@ -7,6 +7,11 @@ import AccountContext
 import LocalAudioTranscription
 import ConvertOpusToAAC
 
+/// Shared by direct speech recognition and the strict alignment wrapper.
+func voiceTranscriptSpeechDeadline(duration: Double) -> Double {
+    return min(900.0, max(90.0, Double(voiceAudioRecognitionChunks(duration: duration).count) * 90.0))
+}
+
 /// Turns recognised words into lines: a line ends after sentence punctuation, a pause, or when it gets long.
 func voiceTranscriptSegments(words: [VoiceTranscriptWord]) -> [VoiceTranscriptSegment] {
     let maxWordsInLine = 14
@@ -120,17 +125,20 @@ private func transcribeAudioChunk(path: String, locales: [String], chunk: VoiceA
                         finish(nil)
                         return
                     }
-                    let absoluteWords = words.compactMap { word -> LocallyTimedWord? in
-                        guard word.start.isFinite, word.end.isFinite, word.end >= word.start else {
-                            return nil
+                    // Validate EVERY relative time, including context and blank tokens,
+                    // before ownership filtering can hide a malformed result.
+                    var previousStart = 0.0
+                    for word in words {
+                        guard word.start.isFinite, word.end.isFinite,
+                              word.start >= previousStart, word.end >= word.start,
+                              word.end <= chunk.audioEnd - chunk.audioStart + 0.5 else {
+                            finish(nil)
+                            return
                         }
-                        let start = chunk.audioStart + word.start
-                        let end = chunk.audioStart + word.end
-                        let midpoint = (start + end) * 0.5
-                        guard midpoint >= chunk.ownedStart, midpoint < chunk.ownedEnd || (chunk.ownedEnd == chunk.audioEnd && midpoint <= chunk.ownedEnd) else {
-                            return nil
-                        }
-                        return LocallyTimedWord(text: word.text, start: start, end: end)
+                        previousStart = word.start
+                    }
+                    let absoluteWords = words.map { word in
+                        LocallyTimedWord(text: word.text, start: chunk.audioStart + word.start, end: chunk.audioStart + word.end)
                     }
                     finish(absoluteWords)
                 }, completed: {
@@ -154,7 +162,7 @@ private func transcribeAudioChunk(path: String, locales: [String], chunk: VoiceA
 
 /// Recognizes windows sequentially so long voice messages stay below Speech's per-request
 /// duration limit. Any failed window fails the whole result rather than silently omitting words.
-private func transcribeAudioInChunks(path: String, locales: [String], chunks: [VoiceAudioRecognitionChunk], index: Int = 0, accumulated: [LocallyTimedWord] = []) -> Signal<[LocallyTimedWord]?, NoError> {
+private func transcribeAudioInChunks(path: String, locales: [String], chunks: [VoiceAudioRecognitionChunk], index: Int = 0, accumulated: [LocallyTimedWord] = [], previousContext: [LocallyTimedWord] = []) -> Signal<[LocallyTimedWord]?, NoError> {
     guard index < chunks.count else {
         return .single(accumulated.isEmpty ? nil : accumulated)
     }
@@ -163,8 +171,89 @@ private func transcribeAudioInChunks(path: String, locales: [String], chunks: [V
         guard let words else {
             return .single(nil)
         }
-        return transcribeAudioInChunks(path: path, locales: locales, chunks: chunks, index: index + 1, accumulated: accumulated + words)
+        let chunk = chunks[index]
+        if index > 0 {
+            guard voiceRecognitionOverlapAgrees(
+                left: previousContext.map { ($0.text, $0.start, $0.end) },
+                right: words.map { ($0.text, $0.start, $0.end) },
+                overlapStart: chunk.audioStart, overlapEnd: chunks[index - 1].audioEnd,
+                ownershipBoundary: chunk.ownedStart
+            ) else { return .single(nil) }
+        }
+        let ownedWords = words.filter { word in
+            let midpoint = (word.start + word.end) * 0.5
+            return midpoint >= chunk.ownedStart && (midpoint < chunk.ownedEnd || (index == chunks.count - 1 && midpoint <= chunk.ownedEnd))
+        }
+        return transcribeAudioInChunks(path: path, locales: locales, chunks: chunks, index: index + 1, accumulated: accumulated + ownedWords, previousContext: words)
     }
+}
+
+/// The converter's cancellation is not a writer-completion barrier. On cancellation
+/// let conversion drain, retaining its TempBox handle until the writer has closed;
+/// deleting earlier can race a late allocation/write. Recognition is cancelled promptly.
+private func transcribeConvertedAudio(path: String, locales: [String], chunks: [VoiceAudioRecognitionChunk]) -> Signal<[LocallyTimedWord]?, NoError> {
+    return Signal { subscriber in
+        let file = EngineTempBox.shared.tempFile(fileName: "audio.m4a")
+        let conversion = MetaDisposable()
+        let recognition = MetaDisposable()
+        // All ownership state below is confined to the main queue.
+        var conversionFinished = false
+        var conversionDelivered = false
+        var disposed = false
+        var finished = false
+        var fileDisposed = false
+        let cleanup: () -> Void = {
+            if conversionFinished && !fileDisposed {
+                fileDisposed = true
+                EngineTempBox.shared.dispose(file)
+            }
+        }
+        let finish: ([LocallyTimedWord]?) -> Void = { words in
+            guard !disposed, !finished else { return }
+            finished = true
+            recognition.dispose()
+            cleanup()
+            subscriber.putNext(words)
+            subscriber.putCompletion()
+        }
+        conversion.set(convertOpusToAAC(sourcePath: path, allocateTempFile: { file.path }).start(next: { convertedPath in
+            Queue.mainQueue().async {
+                conversionFinished = true
+                conversionDelivered = true
+                guard !disposed, !finished else {
+                    cleanup()
+                    return
+                }
+                guard let convertedPath, SFSpeechRecognizer.authorizationStatus() == .authorized else {
+                    finish(nil)
+                    return
+                }
+                recognition.set(transcribeAudioInChunks(path: convertedPath, locales: locales, chunks: chunks).start(next: { words in
+                    finish(words)
+                }, completed: {
+                    finish(nil)
+                }))
+            }
+        }, completed: {
+            Queue.mainQueue().async {
+                conversionFinished = true
+                conversion.dispose()
+                if disposed || finished {
+                    cleanup()
+                } else if !conversionDelivered {
+                    finish(nil)
+                }
+            }
+        }))
+        return ActionDisposable {
+            Queue.mainQueue().async {
+                disposed = true
+                recognition.dispose()
+                cleanup()
+            }
+        }
+    }
+    |> runOn(.mainQueue())
 }
 
 /// Sensitive recognised words stay in a bounded, account- and locale-scoped memory cache only.
@@ -274,14 +363,6 @@ public final class RecognizedVoiceTranscriptProvider: VoiceTranscriptProvider {
             |> map { data -> String? in
                 return data.path
             }
-            |> mapToSignal { path -> Signal<String?, NoError> in
-                guard let path else {
-                    return .single(nil)
-                }
-                return convertOpusToAAC(sourcePath: path, allocateTempFile: {
-                    return EngineTempBox.shared.tempFile(fileName: "audio.m4a").path
-                })
-            }
             |> mapToSignal { path -> Signal<[LocallyTimedWord]?, NoError> in
                 guard let path, SFSpeechRecognizer.authorizationStatus() == .authorized else {
                     return .single(nil)
@@ -290,7 +371,7 @@ public final class RecognizedVoiceTranscriptProvider: VoiceTranscriptProvider {
                 guard !chunks.isEmpty else {
                     return .single(nil)
                 }
-                return transcribeAudioInChunks(path: path, locales: [localeIdentifier], chunks: chunks)
+                return transcribeConvertedAudio(path: path, locales: [localeIdentifier], chunks: chunks)
             }
             |> map { timedWords -> VoiceTranscriptState in
                 guard let timedWords else {
@@ -309,7 +390,7 @@ public final class RecognizedVoiceTranscriptProvider: VoiceTranscriptProvider {
         // One deadline covers message lookup, download, conversion, and recognition, not just the download.
         |> then(Signal<VoiceTranscriptState, NoError>.single(.unavailable))
         |> take(1)
-        |> timeout(min(900.0, max(90.0, Double(voiceAudioRecognitionChunks(duration: duration).count) * 90.0)), queue: Queue.mainQueue(), alternate: .single(.unavailable))
+        |> timeout(voiceTranscriptSpeechDeadline(duration: duration), queue: Queue.mainQueue(), alternate: .single(.unavailable))
         
         return Signal<VoiceTranscriptState, NoError>.single(.loading)
         |> then(recognition)

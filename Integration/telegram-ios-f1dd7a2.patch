@@ -185,10 +185,10 @@ index e50d5d3..f1c60b7 100644
          
          public var subjectModel: EngineMessageReplySubject {
 diff --git a/submodules/Media/LocalAudioTranscription/Sources/LocalAudioTranscription.swift b/submodules/Media/LocalAudioTranscription/Sources/LocalAudioTranscription.swift
-index 243b6220..9e5b01d2 100644
+index 243b6220..848bce84 100644
 --- a/submodules/Media/LocalAudioTranscription/Sources/LocalAudioTranscription.swift
 +++ b/submodules/Media/LocalAudioTranscription/Sources/LocalAudioTranscription.swift
-@@ -4,10 +4,24 @@ import Speech
+@@ -4,19 +4,54 @@ import Speech
  
  private var sharedRecognizers: [String: NSObject] = [:]
  
@@ -213,7 +213,38 @@ index 243b6220..9e5b01d2 100644
  }
  
  private func transcribeAudio(path: String, locale: String) -> Signal<TranscriptionResult?, NoError> {
-@@ -41,13 +55,9 @@ private func transcribeAudio(path: String, locale: String) -> Signal<Transcripti
+     return Signal { subscriber in
+-        let disposable = MetaDisposable()
++        // Speech callbacks and file/task ownership are serialized on main. Cancellation
++        // is marked immediately, including while the authorization prompt is pending.
++        let lock = NSLock()
++        var cancelled = false
++        var finished = false
++        var task: SFSpeechRecognitionTask?
++        var temporaryPath: String?
++        let isCancelled: () -> Bool = {
++            lock.lock()
++            defer { lock.unlock() }
++            return cancelled
++        }
++        let cleanup: () -> Void = {
++            finished = true
++            task?.cancel()
++            task = nil
++            if let path = temporaryPath {
++                temporaryPath = nil
++                try? FileManager.default.removeItem(atPath: path)
++            }
++        }
+         
+         if #available(iOS 13.0, *) {
+             SFSpeechRecognizer.requestAuthorization { status in
+                 Queue.mainQueue().async {
++                    guard !isCancelled(), !finished else { return }
+                     switch status {
+                     case .notDetermined:
+                         subscriber.putNext(nil)
+@@ -41,48 +76,77 @@ private func transcribeAudio(path: String, locale: String) -> Signal<Transcripti
                              speechRecognizerValue.defaultTaskHint = .dictation
                              sharedRecognizers[locale] = speechRecognizerValue
                              speechRecognizer = speechRecognizerValue
@@ -229,30 +260,112 @@ index 243b6220..9e5b01d2 100644
 +                            // particularly in Simulator or for an unsupported locale.
                          }
                          
-                         let tempFilePath = NSTemporaryDirectory() + "/\(UInt64.random(in: 0 ... UInt64.max)).m4a"
-@@ -60,2 +71,8 @@ private func transcribeAudio(path: String, locale: String) -> Signal<TranscriptionResult?, NoError> {
--                        request.requiresOnDeviceRecognition = speechRecognizer.supportsOnDeviceRecognition
+-                        let tempFilePath = NSTemporaryDirectory() + "/\(UInt64.random(in: 0 ... UInt64.max)).m4a"
+-                        let _ = try? FileManager.default.copyItem(atPath: path, toPath: tempFilePath)
++                        let tempFilePath = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("speech-\(UUID().uuidString).m4a").path
++                        temporaryPath = tempFilePath
++                        do {
++                            try FileManager.default.copyItem(atPath: path, toPath: tempFilePath)
++                        } catch {
++                            // copyItem can leave a partial destination. Never remove the input.
++                            cleanup()
++                            subscriber.putNext(nil)
++                            subscriber.putCompletion()
++                            return
++                        }
++                        guard !isCancelled() else {
++                            cleanup()
++                            return
++                        }
+                         
+                         let request = SFSpeechURLRecognitionRequest(url: URL(fileURLWithPath: tempFilePath))
+                         if #available(iOS 16.0, *) {
+                             request.addsPunctuation = true
+                         }
 +                        #if targetEnvironment(simulator)
 +                        // Simulator speech runtimes can report on-device support while their
 +                        // recognition assets are absent. Permit Apple's network recognizer there.
 +                        request.requiresOnDeviceRecognition = false
 +                        #else
-+                        request.requiresOnDeviceRecognition = speechRecognizer.supportsOnDeviceRecognition
+                         request.requiresOnDeviceRecognition = speechRecognizer.supportsOnDeviceRecognition
 +                        #endif
                          request.shouldReportPartialResults = false
-@@ -67,7 +83,10 @@ private func transcribeAudio(path: String, locale: String) -> Signal<Transcripti
-                                     confidence += segment.confidence
+                         
+-                        let task = speechRecognizer.recognitionTask(with: request, resultHandler: { result, error in
+-                            if let result = result {
+-                                var confidence: Float = 0.0
+-                                for segment in result.bestTranscription.segments {
+-                                    confidence += segment.confidence
++                        task = speechRecognizer.recognitionTask(with: request, resultHandler: { result, error in
++                            Queue.mainQueue().async {
++                                guard !isCancelled(), !finished else { return }
++                                if error != nil {
++                                    cleanup()
++                                    subscriber.putNext(nil)
++                                    subscriber.putCompletion()
++                                    return
                                  }
-                                 confidence /= Float(result.bestTranscription.segments.count)
+-                                confidence /= Float(result.bestTranscription.segments.count)
 -                                subscriber.putNext(TranscriptionResult(text: result.bestTranscription.formattedString, confidence: confidence, isFinal: result.isFinal))
-+                                let words = result.bestTranscription.segments.map { segment -> LocallyTimedWord in
-+                                    return LocallyTimedWord(text: segment.substring, start: segment.timestamp, end: segment.timestamp + segment.duration)
-+                                }
-+                                subscriber.putNext(TranscriptionResult(text: result.bestTranscription.formattedString, confidence: confidence, isFinal: result.isFinal, words: words))
-                                 
-                                 if result.isFinal {
+-                                
+-                                if result.isFinal {
++                                if let result = result {
++                                    var confidence: Float = 0.0
++                                    for segment in result.bestTranscription.segments {
++                                        confidence += segment.confidence
++                                    }
++                                    if !result.bestTranscription.segments.isEmpty {
++                                        confidence /= Float(result.bestTranscription.segments.count)
++                                    }
++                                    let words = result.bestTranscription.segments.map { segment -> LocallyTimedWord in
++                                        return LocallyTimedWord(text: segment.substring, start: segment.timestamp, end: segment.timestamp + segment.duration)
++                                    }
++                                    if result.isFinal {
++                                        cleanup()
++                                    }
++                                    subscriber.putNext(TranscriptionResult(text: result.bestTranscription.formattedString, confidence: confidence, isFinal: result.isFinal, words: words))
++
++                                    if result.isFinal {
++                                        subscriber.putCompletion()
++                                    }
++                                } else {
++                                    cleanup()
++                                    print("transcribeAudio: locale: \(locale), error: \(String(describing: error))")
++
++                                    subscriber.putNext(nil)
                                      subscriber.putCompletion()
-@@ -104,15 +123,9 @@ public struct LocallyTranscribedAudio {
+                                 }
+-                            } else {
+-                                print("transcribeAudio: locale: \(locale), error: \(String(describing: error))")
+-                                
+-                                subscriber.putNext(nil)
+-                                subscriber.putCompletion()
+                             }
+                         })
+-                        
+-                        disposable.set(ActionDisposable {
+-                            task.cancel()
+-                        })
+                     @unknown default:
+                         subscriber.putNext(nil)
+                         subscriber.putCompletion()
+@@ -94,7 +158,14 @@ private func transcribeAudio(path: String, locale: String) -> Signal<Transcripti
+             subscriber.putCompletion()
+         }
+         
+-        return disposable
++        return ActionDisposable {
++            lock.lock()
++            cancelled = true
++            lock.unlock()
++            Queue.mainQueue().async {
++                cleanup()
++            }
++        }
+     }
+     |> runOn(.mainQueue())
+ }
+@@ -104,15 +175,9 @@ public struct LocallyTranscribedAudio {
      public var isFinal: Bool
  }
  
@@ -270,7 +383,7 @@ index 243b6220..9e5b01d2 100644
      for locale in locales {
          signals.append(transcribeAudio(path: path, locale: locale))
      }
-@@ -126,12 +139,39 @@ public func transcribeAudio(path: String, appLocale: String) -> Signal<LocallyTr
+@@ -126,12 +191,39 @@ public func transcribeAudio(path: String, appLocale: String) -> Signal<LocallyTr
      }
      
      return resultSignal
@@ -694,7 +807,7 @@ diff --git a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.sw
 index a017f15..2e41c14 100644
 --- a/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
 +++ b/submodules/TelegramUI/Sources/Chat/ChatControllerLoadDisplayNode.swift
-@@ -1686,6 +1686,19 @@ extension ChatControllerImpl {
+@@ -1686,6 +1686,22 @@ extension ChatControllerImpl {
              }
              
              if let messageId = messageId {
@@ -704,6 +817,9 @@ index a017f15..2e41c14 100644
 +                if voiceFragment != nil {
 +                    guard messageId.peerId.namespace != Namespaces.Peer.SecretChat,
 +                          let message = strongSelf.chatDisplayNode.historyNode.messageInCurrentHistoryView(messageId)?._asMessage(),
++                          !message.isCopyProtected(),
++                          !strongSelf.presentationInterfaceState.copyProtectionEnabled,
++                          !strongSelf.presentationInterfaceState.myCopyProtectionEnabled,
 +                          message.minAutoremoveOrClearTimeout != viewOnceTimeout,
 +                          strongSelf.presentationInterfaceState.interfaceState.editMessage == nil else {
 +                        strongSelf.presentVoiceReplyDraftError()
@@ -714,7 +830,7 @@ index a017f15..2e41c14 100644
                  let intrinsicCanSendMessagesHere = canSendMessagesToChat(strongSelf.presentationInterfaceState)
                  var canSendMessagesHere = intrinsicCanSendMessagesHere
                  if case .standard(.embedded) = strongSelf.presentationInterfaceState.mode {
-@@ -1698,8 +1711,22 @@ extension ChatControllerImpl {
+@@ -1698,8 +1714,25 @@ extension ChatControllerImpl {
                  if canSendMessagesHere {
                      let _ = strongSelf.presentVoiceMessageDiscardAlert(action: {
                          if let message = strongSelf.chatDisplayNode.historyNode.messageInCurrentHistoryView(messageId)?._asMessage() {
@@ -723,6 +839,9 @@ index a017f15..2e41c14 100644
 +                                // The discard confirmation can complete asynchronously. Recheck against
 +                                // the current composer/message, not the state from when Quote was pressed.
 +                                guard strongSelf.presentationInterfaceState.interfaceState.editMessage == nil,
++                                      !message.isCopyProtected(),
++                                      !strongSelf.presentationInterfaceState.copyProtectionEnabled,
++                                      !strongSelf.presentationInterfaceState.myCopyProtectionEnabled,
 +                                      message.id.peerId.namespace != Namespaces.Peer.SecretChat,
 +                                      message.minAutoremoveOrClearTimeout != viewOnceTimeout,
 +                                      let updatedInputState = voiceReplyInputState(inputState: inputState, fragment: voiceFragment) else {
@@ -738,7 +857,7 @@ index a017f15..2e41c14 100644
                                      messageId: message.id,
                                      quote: nil,
                                      innerSubject: innerSubject
-@@ -1723,6 +1750,13 @@ extension ChatControllerImpl {
+@@ -1723,6 +1756,13 @@ extension ChatControllerImpl {
                          completion(.immediate, {})
                      }, delay: true)
                  } else {

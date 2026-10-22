@@ -346,6 +346,9 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     private var hasPreviousVoice = false
     private var isSwitchingTabs = false
     private var messageDuration: Double?
+    // Fail closed until the source message and chat protection policy are loaded.
+    private var canExportText = false
+    private weak var activeTextExportController: ViewController?
     private var panStartExpansion: CGFloat = 0.0
     private var didRequestTranscript = false
     private var didRequestSummary = false
@@ -465,11 +468,14 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
 
         self.summaryView.isHidden = true
 
+        self.transcriptView.canExportText = { [weak self] in self?.canExportText == true }
+        self.summaryView.canExportText = { [weak self] in self?.canExportText == true }
+
         self.transcriptView.seekTo = { [weak self] time in
             self?.seek(to: time)
         }
         self.transcriptView.requestReply = { [weak self] text, timeText in
-            guard let self else {
+            guard let self, self.canExportText else {
                 return
             }
             self.requestReply(self.messageId, VoiceReplyFragment(timeText: timeText, text: text))
@@ -488,12 +494,13 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             return self?.snapExpansion() ?? false
         }
         // The ticked tasks are kept for each voice message, so they are still ticked the next time the sheet is opened.
-        let tasksKey = "voiceSummaryTasks_v2_\(context.account.peerId.toInt64())_\(messageId.peerId.toInt64())_\(messageId.namespace)_\(messageId.id)"
-        self.summaryView.loadTaskStates = {
-            return (UserDefaults.standard.dictionary(forKey: tasksKey) as? [String: Bool]) ?? [:]
+        self.summaryView.loadTaskStates = { [weak self] in
+            guard let self else { return [:] }
+            return (UserDefaults.standard.dictionary(forKey: self.tasksKey) as? [String: Bool]) ?? [:]
         }
-        self.summaryView.saveTaskStates = { states in
-            UserDefaults.standard.set(states, forKey: tasksKey)
+        self.summaryView.saveTaskStates = { [weak self] states in
+            guard let self, self.canExportText else { return }
+            UserDefaults.standard.set(states, forKey: self.tasksKey)
         }
         self.summaryView.itemMenuRequested = { [weak self] sourceView, setActive, text, time in
             self?.presentItemMenu(sourceView: sourceView, setActive: setActive, text: text, time: time)
@@ -651,7 +658,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     /// The big button under the summary is always "Share": it is dimmed until there is a real summary to share, so its title
     /// does not change when the summary arrives.
     private func updateCloseButtonTitle() {
-        let isShareable = self.summaryView.shareableText != nil
+        let isShareable = self.canExportText && self.summaryView.shareableText != nil
         self.closeButton.isEnabled = isShareable
         #if DEBUG
         switch self.summaryView.state {
@@ -670,11 +677,12 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
 
     /// The translator of the app, with `text` in it.
     private func presentTranslate(text: String) {
-        guard let controller = self.getController() else {
+        guard self.canExportText, let controller = self.getController() else {
             return
         }
         let context = self.context
-        Task { @MainActor [weak controller] in
+        let messageId = self.messageId
+        Task { @MainActor [weak self, weak controller] in
             let translateController = await context.sharedContext.makeTextProcessingScreen(
                 context: context,
                 theme: nil,
@@ -682,31 +690,37 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
                 // it opens could not be shown over them.
                 mode: .translate(fromLanguage: nil, applyResult: nil, displaysInfoButton: false),
                 inputText: .plain(text: text, entities: []),
-                copyResult: { result in
+                copyResult: { [weak self] result in
+                    guard let self, self.canExportText, self.messageId == messageId else { return }
                     if case let .plain(text, _) = result {
                         UIPasteboard.general.string = text
                     }
                 },
                 translateChat: nil
             )
+            guard let self, self.canExportText, self.messageId == messageId else { return }
+            self.activeTextExportController = translateController
             controller?.present(translateController, in: .window(.root))
         }
     }
 
     private func closeButtonPressed() {
+        guard self.canExportText else { return }
         guard let text = self.summaryView.shareableText, let controller = self.getController() else {
             self.requestDismiss()
             return
         }
         let shareController = self.context.sharedContext.makeShareController(context: self.context, params: ShareControllerParams(subject: .text(text), externalShare: false))
+        self.activeTextExportController = shareController
         controller.present(shareController, in: .window(.root))
     }
 
     /// Recipient-visible plain text, using Telegram's confirmation UI. Never sends automatically.
     private func presentShareQuote(text: String, timeText: String) {
-        guard let controller = self.getController() else { return }
+        guard self.canExportText, let controller = self.getController() else { return }
         let quote = timeText + " — " + text
         let shareController = self.context.sharedContext.makeShareController(context: self.context, params: ShareControllerParams(subject: .text(quote), externalShare: false))
+        self.activeTextExportController = shareController
         controller.present(shareController, in: .window(.root))
     }
 
@@ -799,11 +813,13 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
     /// The menu of a key point or a question: Reply (to the voice message, with the item and its time quoted) and Copy. It opens right
     /// under the item, and above it only when there is no room below.
     private func presentItemMenu(sourceView: UIView, setActive: @escaping (Bool) -> Void, text: String, time: Double) {
-        guard let controller = self.getController() else {
+        guard self.canExportText, let controller = self.getController() else {
             return
         }
         let presentationData = self.presentationData
         let strings = presentationData.strings
+
+        let sourceMessageId = self.messageId
 
         func icon(_ name: String) -> (PresentationTheme) -> UIImage? {
             return { theme in
@@ -816,16 +832,19 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
             guard let self else {
                 return
             }
+            guard self.canExportText, self.messageId == sourceMessageId else { return }
             self.requestReply(self.messageId, VoiceReplyFragment(timeText: formatVoiceTranscriptTime(time), text: text))
         })))
         items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuCopy, icon: icon("Chat/Context Menu/Copy"), action: { [weak self] _, f in
             f(.default)
+            guard let self, self.canExportText, self.messageId == sourceMessageId else { return }
             UIPasteboard.general.string = text
-            self?.showCopiedToast()
+            self.showCopiedToast()
         })))
         items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuShare, icon: icon("Chat/Context Menu/Forward"), action: { [weak self] _, f in
             f(.default)
-            self?.presentShareQuote(text: text, timeText: formatVoiceTranscriptTime(time))
+            guard let self, self.messageId == sourceMessageId else { return }
+            self.presentShareQuote(text: text, timeText: formatVoiceTranscriptTime(time))
         })))
         let contextController = makeContextController(
             presentationData: presentationData,
@@ -914,7 +933,7 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         })))
         items.append(.action(ContextMenuActionItem(text: copyTranscriptTitle, textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Copy"), action: { [weak self] _, f in
             f(.default)
-            guard let self, hasTranscript else {
+            guard let self, self.canExportText, self.messageId == messageId, hasTranscript else {
                 return
             }
             let selectedText = self.transcriptView.selectedTextAndTimes()?.text
@@ -926,21 +945,24 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         })))
         items.append(.action(ContextMenuActionItem(text: strings.VoiceTranscript_TranslateTranscript, textColor: hasTranscript ? .primary : .disabled, icon: icon("Chat/Context Menu/Translate"), action: { [weak self] _, f in
             f(.default)
-            guard hasTranscript else {
+            guard let self, self.canExportText, self.messageId == messageId, hasTranscript else {
                 return
             }
             // The translator of the app, with the whole transcript in it.
-            self?.presentTranslate(text: transcriptText)
+            self.presentTranslate(text: transcriptText)
         })))
-        items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuForward, icon: icon("Chat/Context Menu/Forward"), action: { [weak controller] _, f in
+        items.append(.action(ContextMenuActionItem(text: strings.Conversation_ContextMenuForward, icon: icon("Chat/Context Menu/Forward"), action: { [weak self, weak controller] _, f in
             f(.default)
+            guard let self, self.canExportText, self.messageId == messageId else { return }
             // The whole voice message, through the chat picker the app forwards with.
             let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Messages.Message(id: messageId))
-            |> deliverOnMainQueue).startStandalone(next: { [weak controller] message in
-                guard let message, let controller else {
+            |> deliverOnMainQueue).startStandalone(next: { [weak self, weak controller] message in
+                guard let self, self.canExportText, self.messageId == messageId,
+                      let message, !message._asMessage().isCopyProtected(), let controller else {
                     return
                 }
                 let shareController = context.sharedContext.makeShareController(context: context, params: ShareControllerParams(subject: .messages([message._asMessage()]), externalShare: false))
+                self.activeTextExportController = shareController
                 controller.present(shareController, in: .window(.root))
             })
         })))
@@ -1196,10 +1218,41 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
         }
     }
 
+    private var tasksKey: String {
+        let id = self.messageId
+        return "voiceSummaryTasks_v2_\(self.context.account.peerId.toInt64())_\(id.peerId.toInt64())_\(id.namespace)_\(id.id)"
+    }
+
     private func loadMessage() {
-        self.messageDisposable.set((self.context.engine.data.get(TelegramEngine.EngineData.Item.Messages.Message(id: self.messageId))
-        |> deliverOnMainQueue).start(next: { [weak self] message in
-            guard let self, let message else {
+        let messageId = self.messageId
+        self.messageDisposable.set((self.context.engine.data.subscribe(
+            TelegramEngine.EngineData.Item.Messages.Message(id: messageId),
+            TelegramEngine.EngineData.Item.Peer.CopyProtectionEnabled(id: messageId.peerId),
+            TelegramEngine.EngineData.Item.Peer.MyCopyProtectionEnabled(id: messageId.peerId)
+        ) |> deliverOnMainQueue).start(next: { [weak self] message, peerProtected, myProtected in
+            guard let self, self.messageId == messageId else { return }
+            let allowed = voiceTranscriptAllowsTextExport(
+                messageExists: message != nil,
+                messageProtected: message?._asMessage().isCopyProtected() ?? true,
+                peerProtected: peerProtected, myProtected: myProtected,
+                isSecret: messageId.peerId.namespace == Namespaces.Peer.SecretChat,
+                isViewOnce: message?._asMessage().minAutoremoveOrClearTimeout == viewOnceTimeout
+            )
+            self.canExportText = allowed
+            self.updateCloseButtonTitle()
+            guard allowed, let message else {
+                self.activeTextExportController?.dismiss()
+                self.activeTextExportController = nil
+                self.transcriptDisposable.set(nil)
+                self.summaryDisposable.set(nil)
+                self.didRequestTranscript = false
+                self.didRequestSummary = false
+                self.transcript = nil
+                self.transcriptView.clearSelection()
+                self.transcriptView.transcript = nil
+                self.transcriptView.placeholder = .unavailable
+                self.transcriptView.unavailableMessage = "Transcript unavailable for protected content."
+                self.summaryView.state = .unavailable
                 return
             }
             // "today at 13:40", "yesterday at 13:40", or the date and time.
@@ -1224,6 +1277,9 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
 
     /// The player moved on to another voice message (previous / next, or the end of this one): the sheet follows it.
     private func switchMessage(_ messageId: EngineMessage.Id, item: SharedMediaPlaylistItem) {
+        self.activeTextExportController?.dismiss()
+        self.activeTextExportController = nil
+        self.canExportText = false
         self.messageId = messageId
         if let displayData = item.displayData, case let .voice(author, _) = displayData, let author {
             self.peerTitle = author.displayTitle(strings: self.presentationData.strings, displayOrder: self.presentationData.nameDisplayOrder)
@@ -1266,11 +1322,12 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
 
     private func startSummary(transcript: VoiceTranscript) {
         // Opening a transcript must not automatically send its text to the AI service.
-        guard self.selectedTab == .summary, !self.didRequestSummary else { return }
+        guard self.canExportText, self.selectedTab == .summary, !self.didRequestSummary else { return }
         self.didRequestSummary = true
+        let messageId = self.messageId
         self.summaryDisposable.set((self.provider.summary(context: self.context, messageId: self.messageId, transcript: transcript)
         |> deliverOnMainQueue).start(next: { [weak self] state in
-            guard let self else {
+            guard let self, self.canExportText, self.messageId == messageId else {
                 return
             }
             self.summaryView.state = state
@@ -1320,13 +1377,14 @@ private final class VoiceTranscriptScreenNode: ViewControllerTracingNode, UIGest
 
     private func ensureTranscript(duration: Double) {
         // Wait for the player's position so the list opens already scrolled to the spoken word.
-        guard !self.didRequestTranscript, duration.isFinite, duration > 0.0, self.statusValue != nil else {
+        guard self.canExportText, !self.didRequestTranscript, duration.isFinite, duration > 0.0, self.statusValue != nil else {
             return
         }
         self.didRequestTranscript = true
+        let messageId = self.messageId
         self.transcriptDisposable.set((self.provider.transcript(context: self.context, messageId: self.messageId, duration: duration)
         |> deliverOnMainQueue).start(next: { [weak self] state in
-            guard let self else {
+            guard let self, self.canExportText, self.messageId == messageId else {
                 return
             }
             switch state {
@@ -2430,6 +2488,7 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
     /// A selection is to be translated: the text of it.
     var requestTranslate: ((String) -> Void)?
     var requestShareQuote: ((String, String) -> Void)?
+    var canExportText: (() -> Bool)?
     var consumeScroll: ((CGFloat) -> CGFloat)?
     var scrollEnded: (() -> Bool)?
     private var isAdjustingOffset = false
@@ -2629,19 +2688,19 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
     }
 
     fileprivate func menuForSelection() -> UIMenu? {
-        guard self.selectedTextAndTimes() != nil, let strings = self.presentationData?.strings else {
+        guard self.canExportText?() == true, self.selectedTextAndTimes() != nil, let strings = self.presentationData?.strings else {
             return nil
         }
         // Quote works like Reply: the chat gets a reply to the voice message, with the chosen time and words.
         let quote = UIAction(title: strings.Conversation_ContextMenuQuote, image: UIImage(systemName: "arrowshape.turn.up.left")) { [weak self] _ in
-            guard let self, let selected = self.selectedTextAndTimes() else {
+            guard let self, self.canExportText?() == true, let selected = self.selectedTextAndTimes() else {
                 return
             }
             self.requestReply?(selected.text, selected.timeText)
             self.clearSelection()
         }
         let copy = UIAction(title: strings.Conversation_ContextMenuCopy, image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
-            guard let self, let selected = self.selectedTextAndTimes() else {
+            guard let self, self.canExportText?() == true, let selected = self.selectedTextAndTimes() else {
                 return
             }
             UIPasteboard.general.string = selected.text
@@ -2649,14 +2708,14 @@ private final class VoiceTranscriptListView: UIView, UIScrollViewDelegate, UIGes
         }
         // Translate opens the translator of the app (the same popup as for the whole transcript) with the selected text in it.
         let translate = UIAction(title: strings.Conversation_ContextMenuTranslate) { [weak self] _ in
-            guard let self, let selected = self.selectedTextAndTimes() else {
+            guard let self, self.canExportText?() == true, let selected = self.selectedTextAndTimes() else {
                 return
             }
             self.requestTranslate?(selected.text)
             self.clearSelection()
         }
         let share = UIAction(title: strings.Conversation_ContextMenuShare, image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
-            guard let self, let selected = self.selectedTextAndTimes() else { return }
+            guard let self, self.canExportText?() == true, let selected = self.selectedTextAndTimes() else { return }
             self.requestShareQuote?(selected.text, selected.timeText)
             self.clearSelection()
         }
@@ -3313,6 +3372,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
     /// The ticks outlive the sheet: they are saved by the text of the task, and read back when the summary is shown again.
     var loadTaskStates: (() -> [String: Bool])?
     var saveTaskStates: (([String: Bool]) -> Void)?
+    var canExportText: (() -> Bool)?
     private var taskStateKeys: [String] = []
     /// A tap on a question: the chat is opened with the question quoted in the reply.
     /// A tap on a key point or a question: the view to anchor the menu to (the text of the item), a function that shows the row as active
@@ -3925,6 +3985,7 @@ private final class VoiceSummaryView: UIView, UIScrollViewDelegate {
                 copyButton.setImage(icon, for: .normal)
                 copyButton.frame = CGRect(x: innerWidth - 16.0 - iconWidth / 2.0 - 22.0, y: cardY + 10.0 + 8.0 - 22.0, width: 44.0, height: 44.0)
                 copyButton.addAction(UIAction { [weak self] _ in
+                    guard self?.canExportText?() == true else { return }
                     UIPasteboard.general.string = copyText()
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     self?.copied?()
